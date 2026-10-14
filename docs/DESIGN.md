@@ -1,6 +1,6 @@
 # Usage Metering and Quota Service: Design
 
-Status: draft. Everything marked `TODO` is still open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, and account API-key authentication are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
 
 ## 1. Overview
 
@@ -92,6 +92,8 @@ Requests table columns:
 `outcome` and `decision` are nullable because the claim insert happens first and the update happens later. Both occur in one transaction, so no committed row has them empty. Plain columns exist for everything the history endpoint filters on. The JSON column makes replays exact and survives plan edits.
 
 Plan ownership (a custom plan must belong to the same account) is enforced in service code and covered by tests. Plan kind is enforced by the database.
+
+Account API keys contain 256 random bits, are returned only at account creation, and are stored as SHA-256 hashes. Hashing is appropriate here because randomly generated keys have high entropy and cannot feasibly be recovered from their digest.
 
 TODO: ER diagram in `docs/`.
 
@@ -247,7 +249,7 @@ TODO: lock timeout value, and the error code and status for a request that times
 7. A business rejection returns 200 with `accepted: false`. Error statuses are for broken requests, so clients that auto-retry 4xx or 429 do not hammer the service.
 8. Predefined plans have no daily allowance. The numbers below are examples.
 9. API keys are random, shown once, and stored only as a hash.
-10. TODO: maximum value for units.
+10. Units and plan limits are capped at `Number.MAX_SAFE_INTEGER` (`9007199254740991`). The API uses JSON numbers, so accepting larger integers could silently lose precision in JavaScript. PostgreSQL stores them as `BIGINT`, and the schema enforces the same bound.
 
 ## 12. Design decisions and tradeoffs (draft)
 
@@ -310,7 +312,6 @@ Step 5 uses a new ID because replaying the rejected ID would return the stored r
 
 ## 16. Open questions
 
-- TODO: units maximum
 - TODO: lock timeout, pool size
 - TODO: exact bodies for the plan and user endpoints
 - TODO: confirm the daily allowance is in scope after the core is working
