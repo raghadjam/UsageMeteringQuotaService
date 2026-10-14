@@ -397,3 +397,232 @@ test("users are created, listed, and fetched only within their authenticated acc
   );
   assert.equal(otherAccountUserCount.rows[0].count, "1");
 });
+
+test("plans are account-scoped, predefined plans are read-only, and assignments update current limits", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { accountId, starterPlanId, basicPlanId } = requireSeed();
+  const ownerKey = randomUUID() + randomUUID();
+  const otherKey = randomUUID() + randomUUID();
+
+  await pool.query(
+    "UPDATE accounts SET api_key_hash = $1 WHERE id = $2",
+    [hashApiKey(ownerKey), accountId],
+  );
+  const otherAccountResult = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Plan-test other account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(otherKey), starterPlanId],
+  );
+  const otherAccountId = otherAccountResult.rows[0].id;
+  const otherUserResult = await pool.query<{ id: string }>(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'plan-test-user', $2)
+     RETURNING id`,
+    [otherAccountId, basicPlanId],
+  );
+  const customUserPlanName = `Writer ${randomUUID().slice(0, 8)}`;
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+  const ownerHeaders = { "X-API-Key": ownerKey };
+  const otherHeaders = { "X-API-Key": otherKey };
+
+  const list = await request(app).get("/v1/plans").set(ownerHeaders);
+  assert.equal(list.status, 200);
+  assert.deepEqual(
+    list.body.plans.map((plan: { name: string }) => plan.name).sort(),
+    ["Basic", "Premium", "Pro", "Starter", "User-test custom plan"],
+  );
+  const userPlanList = await request(app)
+    .get("/v1/plans?kind=user")
+    .set(ownerHeaders);
+  assert.equal(userPlanList.status, 200);
+  assert.ok(userPlanList.body.plans.every((plan: { kind: string }) => plan.kind === "user"));
+  const predefinedPlan = await request(app)
+    .get(`/v1/plans/${basicPlanId}`)
+    .set(ownerHeaders);
+  assert.equal(predefinedPlan.status, 200);
+  assert.equal(predefinedPlan.body.plan.is_predefined, true);
+
+  const invalidPlan = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: "unsafe",
+      monthly_allowance: 9007199254740992,
+      max_per_request: 1,
+    });
+  assert.equal(invalidPlan.status, 400);
+
+  const accountPlanResponse = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "account",
+      name: "Team Plus",
+      monthly_allowance: 5000,
+      max_per_request: 250,
+    });
+  assert.equal(accountPlanResponse.status, 201);
+  const accountPlan = accountPlanResponse.body.plan;
+  assert.equal(accountPlan.is_predefined, false);
+
+  const userPlanResponse = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: customUserPlanName,
+      monthly_allowance: 300,
+      max_per_request: 40,
+    });
+  assert.equal(userPlanResponse.status, 201);
+  const userPlan = userPlanResponse.body.plan;
+
+  const duplicateName = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: customUserPlanName,
+      monthly_allowance: 400,
+      max_per_request: 50,
+    });
+  assert.equal(duplicateName.status, 409);
+
+  const visibleCustomPlan = await request(app)
+    .get(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders);
+  assert.equal(visibleCustomPlan.status, 200);
+  const hiddenPlan = await request(app)
+    .get(`/v1/plans/${userPlan.id}`)
+    .set(otherHeaders);
+  assert.equal(hiddenPlan.status, 404);
+
+  const otherPlanList = await request(app).get("/v1/plans").set(otherHeaders);
+  assert.equal(otherPlanList.status, 200);
+  assert.equal(otherPlanList.body.plans.length, 4);
+
+  const builtinPatch = await request(app)
+    .patch(`/v1/plans/${basicPlanId}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 200 });
+  assert.equal(builtinPatch.status, 404);
+
+  const emptyPatch = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({});
+  assert.equal(emptyPatch.status, 400);
+
+  const updatedPlan = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 350, max_per_request: 45 });
+  assert.equal(updatedPlan.status, 200);
+  assert.equal(updatedPlan.body.plan.monthly_allowance, 350);
+  assert.equal(updatedPlan.body.plan.max_per_request, 45);
+  const duplicatePlanUpdate = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({ name: "User-test custom plan" });
+  assert.equal(duplicatePlanUpdate.status, 409);
+
+  const foreignPlanPatch = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(otherHeaders)
+    .send({ name: "Taken over" });
+  assert.equal(foreignPlanPatch.status, 404);
+
+  const createdUser = await request(app)
+    .post("/v1/users")
+    .set(ownerHeaders)
+    .send({ external_id: "plan-assignment-user" });
+  assert.equal(createdUser.status, 201);
+  const usageMonth = "2026-10-01";
+  await pool.query(
+    "INSERT INTO account_usage (account_id, month, units_used) VALUES ($1, $2, 17)",
+    [accountId, usageMonth],
+  );
+  await pool.query(
+    "INSERT INTO user_usage (user_id, month, units_used) VALUES ($1, $2, 9)",
+    [createdUser.body.user.id, usageMonth],
+  );
+
+  const assignUser = await request(app)
+    .put("/v1/users/plan-assignment-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(assignUser.status, 200);
+  assert.equal(assignUser.body.plan.id, userPlan.id);
+
+  const userWithUpdatedPlan = await request(app)
+    .get("/v1/users/plan-assignment-user")
+    .set(ownerHeaders);
+  assert.equal(userWithUpdatedPlan.status, 200);
+  assert.equal(userWithUpdatedPlan.body.user.plan.monthly_allowance, 350);
+  assert.equal(userWithUpdatedPlan.body.user.plan.max_per_request, 45);
+  const retainedUsage = await pool.query<{
+    account_units: string;
+    user_units: string;
+  }>(
+    `SELECT au.units_used::text AS account_units, uu.units_used::text AS user_units
+     FROM account_usage au
+     JOIN user_usage uu ON uu.month = au.month
+     WHERE au.account_id = $1 AND uu.user_id = $2 AND au.month = $3`,
+    [accountId, createdUser.body.user.id, usageMonth],
+  );
+  assert.deepEqual(retainedUsage.rows[0], { account_units: "17", user_units: "9" });
+
+  const wrongKindForUser = await request(app)
+    .put("/v1/users/plan-assignment-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: accountPlan.id });
+  assert.equal(wrongKindForUser.status, 404);
+
+  const assignAccount = await request(app)
+    .put("/v1/account/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: accountPlan.id });
+  assert.equal(assignAccount.status, 200);
+  assert.equal(assignAccount.body.plan.id, accountPlan.id);
+
+  const updatedAccountPlan = await request(app)
+    .patch(`/v1/plans/${accountPlan.id}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 5500 });
+  assert.equal(updatedAccountPlan.status, 200);
+
+  const currentAccount = await request(app)
+    .get("/v1/account")
+    .set(ownerHeaders);
+  assert.equal(currentAccount.status, 200);
+  assert.equal(currentAccount.body.plan.id, accountPlan.id);
+  assert.equal(currentAccount.body.plan.monthly_allowance, 5500);
+
+  const wrongKindForAccount = await request(app)
+    .put("/v1/account/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(wrongKindForAccount.status, 404);
+
+  const foreignPlanAssignment = await request(app)
+    .put("/v1/users/plan-test-user/plan")
+    .set(otherHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(foreignPlanAssignment.status, 404);
+
+  const missingUserAssignment = await request(app)
+    .put("/v1/users/no-such-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(missingUserAssignment.status, 404);
+
+  const hiddenForeignUser = await request(app)
+    .get("/v1/users/plan-test-user")
+    .set(ownerHeaders);
+  assert.equal(hiddenForeignUser.status, 404);
+  assert.ok(otherUserResult.rows[0].id);
+});

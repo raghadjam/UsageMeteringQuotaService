@@ -1,6 +1,6 @@
 # Usage Metering and Quota Service: Design
 
-Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, account API-key authentication, and account-scoped user registration/lookup/listing are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, account API-key authentication, account-scoped user management, custom plan management, and plan assignments are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
 
 ## 1. Overview
 
@@ -160,7 +160,7 @@ Pagination is cursor-based on (created_at, id), with `limit` (default 50, max 20
 
 User registration accepts `{ "external_id": "sara-42", "plan_id": "<optional-user-plan-uuid>" }`. The plan must be predefined or owned by the authenticated account; it defaults to Basic. `GET /users` accepts a cursor and a limit from 1 to 200 (default 50) and returns `next_cursor`.
 
-TODO: exact request bodies for the plan and plan-switch endpoints.
+Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allowance": 500, "max_per_request": 40 }`; updates accept a non-empty subset of `name`, `monthly_allowance`, and `max_per_request`. `PUT /account/plan` and `PUT /users/:externalId/plan` accept `{ "plan_id": "<uuid>" }`. Both assignment endpoints validate kind and ownership and preserve existing usage.
 
 ## 6. Consume flow
 

@@ -107,5 +107,34 @@ The user list uses a stable `(created_at, id)` cursor and an account-scoped
 database index. Duplicate external IDs within one account return 409; the same
 external ID may be used by another account.
 
-The plan-management, plan-switch, consume, history, client, Docker Compose, and
-performance-test features remain to be implemented.
+## Plans and assignments
+
+List the predefined plans and the authenticated account's custom plans. Filter
+by kind with `?kind=account` or `?kind=user`. A custom plan is visible only to
+the account that created it.
+
+```sh
+curl "http://localhost:3000/v1/plans?kind=user" \
+  -H "X-API-Key: <account-api-key>"
+```
+
+Create account- or user-level custom plans, then update a custom plan with
+`PATCH /v1/plans/:id`. Predefined plans are read-only; attempts to update them
+or access another account's custom plan return 404. Names are unique within
+their owner and plan kind.
+
+```sh
+curl -X POST http://localhost:3000/v1/plans \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <account-api-key>" \
+  -d '{"kind":"user","name":"Writer","monthly_allowance":500,"max_per_request":40}'
+```
+
+Assign an account plan with `PUT /v1/account/plan` or a user plan with
+`PUT /v1/users/:externalId/plan`, each accepting `{"plan_id":"<uuid>"}`.
+Assignments accept predefined plans or plans owned by that account, and only
+plans of the matching kind. Plan edits and switches preserve accumulated usage;
+the changed plan limits are returned by subsequent account/user reads.
+
+The consume, history, example client, Docker Compose, and performance-test
+features remain to be implemented.
