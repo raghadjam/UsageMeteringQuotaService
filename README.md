@@ -79,5 +79,33 @@ role can create and drop schemas:
 TEST_DATABASE_URL="postgres://postgres:password@localhost:5432/usage_metering" npm run test:db
 ```
 
-The user, plan-management, consume, history, client, Docker Compose, and
+## Users
+
+Register users with an account API key. `external_id` is the caller's stable
+identifier; `plan_id` is optional and defaults to Basic. Users may be assigned a
+predefined user plan or a custom user plan created by the same account.
+
+```sh
+curl -X POST http://localhost:3000/v1/users \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <account-api-key>" \
+  -d '{"external_id":"sara-42"}'
+```
+
+List users with cursor pagination (default 50, maximum 200 per page), or fetch a
+single user by external ID. Every query is scoped to the account identified by
+the API key; a user belonging to a different account returns 404.
+
+```sh
+curl "http://localhost:3000/v1/users?limit=50" \
+  -H "X-API-Key: <account-api-key>"
+curl "http://localhost:3000/v1/users/sara-42" \
+  -H "X-API-Key: <account-api-key>"
+```
+
+The user list uses a stable `(created_at, id)` cursor and an account-scoped
+database index. Duplicate external IDs within one account return 409; the same
+external ID may be used by another account.
+
+The plan-management, plan-switch, consume, history, client, Docker Compose, and
 performance-test features remain to be implemented.

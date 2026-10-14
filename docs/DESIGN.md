@@ -1,6 +1,6 @@
 # Usage Metering and Quota Service: Design
 
-Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, and account API-key authentication are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, account API-key authentication, and account-scoped user registration/lookup/listing are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
 
 ## 1. Overview
 
@@ -158,7 +158,9 @@ Errors share one shape: `{ "error": { "code": "request_id_conflict", "message": 
 
 Pagination is cursor-based on (created_at, id), with `limit` (default 50, max 200) and `next_cursor` in the response.
 
-TODO: exact request bodies for the user, plan and plan-switch endpoints.
+User registration accepts `{ "external_id": "sara-42", "plan_id": "<optional-user-plan-uuid>" }`. The plan must be predefined or owned by the authenticated account; it defaults to Basic. `GET /users` accepts a cursor and a limit from 1 to 200 (default 50) and returns `next_cursor`.
+
+TODO: exact request bodies for the plan and plan-switch endpoints.
 
 ## 6. Consume flow
 

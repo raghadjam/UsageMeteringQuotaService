@@ -88,13 +88,16 @@ if (connectionString) {
   });
 }
 
-test("migration initializes schema and can be applied repeatedly", {
+test("migrations initialize schema and can be applied repeatedly", {
   skip: !connectionString,
 }, async () => {
-  const result = await requireTestPool().query<{ count: string }>(
-    "SELECT count(*)::text AS count FROM schema_migrations",
+  const result = await requireTestPool().query<{ name: string }>(
+    "SELECT name FROM schema_migrations ORDER BY name",
   );
-  assert.equal(result.rows[0].count, "1");
+  assert.deepEqual(result.rows.map((row) => row.name), [
+    "001_initial_schema.sql",
+    "002_users_list_index.sql",
+  ]);
 });
 
 test("plan-kind relationships are constrained", {
@@ -253,4 +256,144 @@ test("admin can create accounts and receives a one-time API key", {
     .set("X-API-Key", created.body.api_key);
   assert.equal(authenticated.status, 200);
   assert.equal(authenticated.body.id, created.body.id);
+});
+
+test("users are created, listed, and fetched only within their authenticated account", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { accountId, starterPlanId, basicPlanId } = requireSeed();
+  const firstApiKey = randomUUID() + randomUUID();
+  const secondApiKey = randomUUID() + randomUUID();
+
+  await pool.query(
+    "UPDATE accounts SET api_key_hash = $1 WHERE id = $2",
+    [hashApiKey(firstApiKey), accountId],
+  );
+  const secondAccountResult = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Second user-test account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(secondApiKey), starterPlanId],
+  );
+  const secondAccountId = secondAccountResult.rows[0].id;
+  const customPlanResult = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', $1, 'User-test custom plan', 250, 30)
+     RETURNING id`,
+    [accountId],
+  );
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+
+  const created = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "demo-user" });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.user.external_id, "demo-user");
+  assert.equal(created.body.user.plan.id, basicPlanId);
+  assert.equal(created.body.user.plan.name, "Basic");
+
+  const duplicate = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "demo-user" });
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicate.body.error.code, "user_already_exists");
+
+  const assignedCustomPlan = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "custom-plan-user", plan_id: customPlanResult.rows[0].id });
+  assert.equal(assignedCustomPlan.status, 201);
+  assert.equal(assignedCustomPlan.body.user.plan.name, "User-test custom plan");
+
+  const wrongPlanKind = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "wrong-plan-kind", plan_id: starterPlanId });
+  assert.equal(wrongPlanKind.status, 404);
+
+  const crossAccountCustomPlan = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", secondApiKey)
+    .send({
+      external_id: "cross-account-plan",
+      plan_id: customPlanResult.rows[0].id,
+    });
+  assert.equal(crossAccountCustomPlan.status, 404);
+
+  const otherAccountUser = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", secondApiKey)
+    .send({ external_id: "private-user" });
+  assert.equal(otherAccountUser.status, 201);
+
+  const isolatedLookup = await request(app)
+    .get("/v1/users/demo-user")
+    .set("X-API-Key", secondApiKey);
+  assert.equal(isolatedLookup.status, 404);
+  const isolatedList = await request(app)
+    .get("/v1/users")
+    .set("X-API-Key", secondApiKey);
+  assert.equal(isolatedList.status, 200);
+  assert.deepEqual(
+    isolatedList.body.users.map((user: { external_id: string }) => user.external_id),
+    ["private-user"],
+  );
+
+  const lookup = await request(app)
+    .get("/v1/users/demo-user")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(lookup.status, 200);
+  assert.equal(lookup.body.user.id, created.body.user.id);
+
+  for (const externalId of ["page-user-a", "page-user-b", "page-user-c"]) {
+    const response = await request(app)
+      .post("/v1/users")
+      .set("X-API-Key", firstApiKey)
+      .send({ external_id: externalId });
+    assert.equal(response.status, 201);
+  }
+
+  const firstPage = await request(app)
+    .get("/v1/users?limit=2")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(firstPage.status, 200);
+  assert.equal(firstPage.body.users.length, 2);
+  assert.equal(typeof firstPage.body.next_cursor, "string");
+
+  const secondPage = await request(app)
+    .get("/v1/users")
+    .query({ limit: 2, cursor: firstPage.body.next_cursor })
+    .set("X-API-Key", firstApiKey);
+  assert.equal(secondPage.status, 200);
+  assert.equal(secondPage.body.users.length, 2);
+  assert.notEqual(firstPage.body.users[1].id, secondPage.body.users[0].id);
+
+  const thirdPage = await request(app)
+    .get("/v1/users")
+    .query({ limit: 2, cursor: secondPage.body.next_cursor })
+    .set("X-API-Key", firstApiKey);
+  assert.equal(thirdPage.status, 200);
+  assert.equal(thirdPage.body.users.length, 2);
+  assert.equal(thirdPage.body.next_cursor, null);
+  const pagedIds = [
+    ...firstPage.body.users,
+    ...secondPage.body.users,
+    ...thirdPage.body.users,
+  ].map((user: { id: string }) => user.id);
+  assert.equal(new Set(pagedIds).size, pagedIds.length);
+
+  const invalidCursor = await request(app)
+    .get("/v1/users?cursor=invalid")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(invalidCursor.status, 400);
+  assert.equal(invalidCursor.body.error.code, "invalid_cursor");
+
+  const otherAccountUserCount = await pool.query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM users WHERE account_id = $1",
+    [secondAccountId],
+  );
+  assert.equal(otherAccountUserCount.rows[0].count, "1");
 });
