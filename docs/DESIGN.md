@@ -158,6 +158,18 @@ Errors share one shape: `{ "error": { "code": "request_id_conflict", "message": 
 
 Pagination is cursor-based on (created_at, id), with `limit` (default 50, max 200) and `next_cursor` in the response.
 
+Usage month is an optional UTC calendar month (`YYYY-MM`); omitting it selects
+the database's current UTC month. Account usage includes each registered user's
+usage for the selected month. `remaining` is returned for the current month
+only; historical usage returns `remaining: null`. The displayed plan is the
+plan currently assigned, while request history contains the immutable plan and
+limit snapshot captured when each decision was made.
+
+Request history accepts optional `user_id` (external user ID), `month`, and
+`outcome=accepted|rejected` filters. History pagination is newest-first using
+the stable `(created_at, id)` cursor; each result includes the persisted
+decision JSON and rejection details.
+
 User registration accepts `{ "external_id": "sara-42", "plan_id": "<optional-user-plan-uuid>" }`. The plan must be predefined or owned by the authenticated account; it defaults to Basic. `GET /users` accepts a cursor and a limit from 1 to 200 (default 50) and returns `next_cursor`.
 
 Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allowance": 500, "max_per_request": 40 }`; updates accept a non-empty subset of `name`, `monthly_allowance`, and `max_per_request`. `PUT /account/plan` and `PUT /users/:externalId/plan` accept `{ "plan_id": "<uuid>" }`. Both assignment endpoints validate kind and ownership and preserve existing usage.

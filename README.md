@@ -164,6 +164,35 @@ input returns 409. Account and user plan changes synchronize with consumption,
 so requests starting after a change commits see the new limits. Usage already
 consumed is retained if a limit is reduced or a plan is switched.
 
-Request history is persisted for every completed decision. Dedicated usage and
-history-query endpoints, the example client, Docker Compose, and performance
-tests are still to be implemented.
+## Usage and request history
+
+Read account-wide and per-user totals for the current UTC month, or select a
+past month with `?month=YYYY-MM`. The account total is shared across its users.
+Past-month responses report consumed units and return `remaining: null`, because
+remaining allowance is meaningful only against the currently applied plans.
+The account and user plan objects show the limits currently applied; each
+request history entry retains the plan/limit snapshot that was used to decide
+that request.
+
+```sh
+curl "http://localhost:3000/v1/usage?month=2026-10" \
+  -H "X-API-Key: <account-api-key>"
+curl "http://localhost:3000/v1/users/sara-42/usage?month=2026-10" \
+  -H "X-API-Key: <account-api-key>"
+```
+
+List request outcomes using cursor pagination (default 50, maximum 200).
+Optional filters are `user_id` (the account's external user ID), `month`, and
+`outcome=accepted|rejected`. History is always scoped to the API-key account.
+
+```sh
+curl "http://localhost:3000/v1/requests?user_id=sara-42&month=2026-10&limit=50" \
+  -H "X-API-Key: <account-api-key>"
+```
+
+History pages include the stored decision snapshot, rejection level/rule,
+request ID, and timestamp. Replaying a request does not add another history
+entry.
+
+The example client, Docker Compose, and performance tests remain to be
+implemented.

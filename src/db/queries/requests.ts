@@ -1,9 +1,67 @@
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 export interface ExistingRequest {
   user_external_id: string;
   units: string;
   decision: unknown;
+}
+
+export interface RequestHistoryFilters {
+  accountId: string;
+  userExternalId?: string;
+  month?: string;
+  outcome?: "accepted" | "rejected";
+  limit: number;
+  cursor?: { createdAt: string; id: string };
+}
+
+export interface RequestHistoryRecord {
+  id: string;
+  request_id: string;
+  user_id: string;
+  units: string;
+  month: string;
+  outcome: "accepted" | "rejected";
+  rejected_level: "account" | "user" | null;
+  rejected_rule: "per_request" | "monthly_allowance" | null;
+  decision: unknown;
+  created_at: string;
+}
+
+export async function listRequestHistory(
+  pool: Pool,
+  filters: RequestHistoryFilters,
+): Promise<RequestHistoryRecord[]> {
+  const result = await pool.query<RequestHistoryRecord>(
+    `SELECT r.id, r.request_id, u.external_id AS user_id,
+            r.units::text AS units, to_char(r.month, 'YYYY-MM') AS month,
+            r.outcome, r.rejected_level, r.rejected_rule, r.decision,
+            to_char(r.created_at AT TIME ZONE 'UTC',
+                    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+     FROM requests r
+     JOIN users u ON u.id = r.user_id
+     WHERE r.account_id = $1
+       AND r.outcome IS NOT NULL
+       AND ($2::text IS NULL OR u.external_id = $2)
+       AND ($3::date IS NULL OR r.month = $3::date)
+       AND ($4::text IS NULL OR r.outcome = $4)
+       AND (
+         $5::timestamptz IS NULL
+         OR (r.created_at, r.id) < ($5::timestamptz, $6::uuid)
+       )
+     ORDER BY r.created_at DESC, r.id DESC
+     LIMIT $7`,
+    [
+      filters.accountId,
+      filters.userExternalId ?? null,
+      filters.month ? `${filters.month}-01` : null,
+      filters.outcome ?? null,
+      filters.cursor?.createdAt ?? null,
+      filters.cursor?.id ?? null,
+      filters.limit,
+    ],
+  );
+  return result.rows;
 }
 
 export async function claimRequest(
