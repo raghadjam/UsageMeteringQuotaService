@@ -1,13 +1,13 @@
 # Usage Metering and Quota Service
 
 Backend service for recording usage and enforcing account-level and user-level
-quotas. The database foundation, account creation, and API-key authentication
-are implemented; remaining API behavior is being built in milestones.
+quotas. Accounts, users, custom plans, plan assignments, and transactional
+consumption with idempotent request history are implemented.
 
-## Database foundation
+## Database and tests
 
-The initial PostgreSQL migration creates the plan, account, user, usage, and
-request-history tables, enforces their core relationships, and seeds the
+PostgreSQL migrations create the plan, account, user, usage, and request-history
+tables, enforce their core relationships, and seed the
 Starter, Pro, Basic, and Premium plans. It requires PostgreSQL 13 or newer.
 Applying migrations repeatedly is safe. Units and plan limits are bounded by
 `9007199254740991` (`Number.MAX_SAFE_INTEGER`) to keep JSON integer values exact.
@@ -136,5 +136,34 @@ Assignments accept predefined plans or plans owned by that account, and only
 plans of the matching kind. Plan edits and switches preserve accumulated usage;
 the changed plan limits are returned by subsequent account/user reads.
 
-The consume, history, example client, Docker Compose, and performance-test
-features remain to be implemented.
+## Consume units
+
+Call `POST /v1/consume` with the account API key, a registered `user_id`, a
+positive whole-number `units` value, and a caller-generated `request_id`:
+
+```sh
+curl -X POST http://localhost:3000/v1/consume \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <account-api-key>" \
+  -d '{"user_id":"sara-42","units":10,"request_id":"document-123"}'
+```
+
+The service evaluates limits in a fixed order: user per-request, account
+per-request, user monthly allowance, then account monthly allowance. A
+successful response is `200` and contains `accepted: true`; a quota rejection
+is also `200`, with `accepted: false` and a `rejected_by` level and rule.
+Responses include the plan snapshots and consumed/remaining monthly units for
+both levels.
+
+Requests are processed against the database clock's UTC calendar month. A
+rejection consumes no units. Accepted requests increment account and user
+totals atomically, and request outcomes are stored in PostgreSQL. The pair
+`(account, request_id)` is idempotent: retrying the same user and units returns
+the original decision with `replayed: true`; reusing the ID with different
+input returns 409. Account and user plan changes synchronize with consumption,
+so requests starting after a change commits see the new limits. Usage already
+consumed is retained if a limit is reduced or a plan is switched.
+
+Request history is persisted for every completed decision. Dedicated usage and
+history-query endpoints, the example client, Docker Compose, and performance
+tests are still to be implemented.

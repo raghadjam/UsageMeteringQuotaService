@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import {
   assignAccountPlan as assignAccountPlanQuery,
   assignUserPlan as assignUserPlanQuery,
@@ -30,6 +30,39 @@ function isCheckViolation(error: unknown): boolean {
     "code" in error &&
     error.code === "23514"
   );
+}
+
+async function withAccountPlanLock<T>(
+  pool: Pool,
+  accountId: string,
+  action: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  let inTransaction = false;
+
+  try {
+    await client.query("BEGIN");
+    inTransaction = true;
+    const account = await client.query(
+      "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+      [accountId],
+    );
+    if (account.rowCount !== 1) {
+      throw new AppError(404, "account_not_found", "Account not found");
+    }
+
+    const result = await action(client);
+    await client.query("COMMIT");
+    inTransaction = false;
+    return result;
+  } catch (error) {
+    if (inTransaction) {
+      await client.query("ROLLBACK");
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function listPlans(
@@ -81,11 +114,13 @@ export async function updatePlan(
   update: PlanUpdate,
 ): Promise<PlanRecord> {
   try {
-    const plan = await updatePlanQuery(pool, accountId, planId, update);
-    if (!plan) {
-      throw new AppError(404, "plan_not_found", "Plan not found");
-    }
-    return plan;
+    return await withAccountPlanLock(pool, accountId, async (client) => {
+      const plan = await updatePlanQuery(client, accountId, planId, update);
+      if (!plan) {
+        throw new AppError(404, "plan_not_found", "Plan not found");
+      }
+      return plan;
+    });
   } catch (error) {
     if (isUniqueViolation(error)) {
       throw new AppError(409, "plan_name_conflict", "A plan with this name already exists");
@@ -116,11 +151,13 @@ export async function assignAccountPlan(
   planId: string,
 ): Promise<PlanRecord> {
   await requirePlanKind(pool, accountId, planId, "account");
-  const plan = await assignAccountPlanQuery(pool, accountId, planId);
-  if (!plan) {
-    throw new AppError(404, "plan_not_found", "Plan not found");
-  }
-  return plan;
+  return withAccountPlanLock(pool, accountId, async (client) => {
+    const plan = await assignAccountPlanQuery(client, accountId, planId);
+    if (!plan) {
+      throw new AppError(404, "plan_not_found", "Plan not found");
+    }
+    return plan;
+  });
 }
 
 export async function assignUserPlan(
@@ -131,9 +168,11 @@ export async function assignUserPlan(
 ): Promise<PlanRecord> {
   await getUser(pool, accountId, externalId);
   await requirePlanKind(pool, accountId, planId, "user");
-  const plan = await assignUserPlanQuery(pool, accountId, externalId, planId);
-  if (!plan) {
-    throw new AppError(404, "user_not_found", "User not found");
-  }
-  return plan;
+  return withAccountPlanLock(pool, accountId, async (client) => {
+    const plan = await assignUserPlanQuery(client, accountId, externalId, planId);
+    if (!plan) {
+      throw new AppError(404, "user_not_found", "User not found");
+    }
+    return plan;
+  });
 }

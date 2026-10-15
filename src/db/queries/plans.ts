@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 export type PlanKind = "account" | "user";
 
@@ -81,7 +81,7 @@ export async function insertPlan(
 }
 
 export async function updatePlan(
-  pool: Pool,
+  pool: PoolClient,
   accountId: string,
   planId: string,
   update: PlanUpdate,
@@ -108,7 +108,7 @@ export async function updatePlan(
 }
 
 export async function assignAccountPlan(
-  pool: Pool,
+  pool: PoolClient,
   accountId: string,
   planId: string,
 ): Promise<PlanRecord | undefined> {
@@ -130,7 +130,7 @@ export async function assignAccountPlan(
 }
 
 export async function assignUserPlan(
-  pool: Pool,
+  pool: PoolClient,
   accountId: string,
   externalId: string,
   planId: string,

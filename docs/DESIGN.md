@@ -164,12 +164,14 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 
 ## 6. Consume flow
 
-1. Authenticate the key, validate the input, run the per-request checks (no lock needed).
+1. Authenticate the key and validate the input.
 2. Open a transaction. The month comes from the database clock, in UTC, taken at transaction start.
 3. Claim the request: insert (account_id, request_id, user, units) with `ON CONFLICT DO NOTHING`.
 4. If the insert did nothing, the ID is already claimed. Read the stored row. Same user and units: return the stored decision with `replayed: true`. Different user or units: return 409.
 5. Make sure this month's usage rows exist (insert with `ON CONFLICT DO NOTHING`, units_used = 0).
-6. Call the strategy: check the rules and update the usage rows. Lock order is always user first, then account.
+6. Call the locking strategy: check the rules and update the usage rows. The
+   account and user rows are held with shared locks to synchronize with plan
+   edits and assignments; usage lock order is always user first, then account.
 7. Write the outcome and the decision JSON to the request row, commit.
 8. Respond.
 
@@ -185,7 +187,9 @@ TODO: sequence diagram in `docs/`.
 | Max per request | account and user | Largest amount in a single request |
 | Daily allowance | account and user (planned) | Total units in a UTC day. Empty means no daily cap. Built last, after the core works |
 
-Rejection order when several rules fail: user per-request, account per-request, user monthly, account monthly, user daily, account daily. Both strategies must use this order.
+Rejection order when several rules fail: user per-request, account per-request,
+user monthly, account monthly, user daily, account daily. Implemented rules use
+the first four checks; daily allowance remains planned.
 
 Remaining is `max(0, limit - used)` and never negative. A request must pass every rule at both levels. A rejection consumes nothing at either level.
 
@@ -205,7 +209,12 @@ TODO: confirm how the daily allowance appears in `remaining` (the lower of the d
 
 Same request ID arriving at the same instant: the unique constraint on (account_id, request_id) makes the second insert wait for the first transaction. After the first commits, the second sees the conflict and replays the stored decision. Units are counted once.
 
-Different requests competing for the last units: the baseline strategy locks the user usage row, then the account usage row, with `FOR NO KEY UPDATE`, reads both, checks the rules, and updates. Fixed lock order prevents deadlocks. The account row is the known hot spot, since every user in the account updates it.
+Different requests competing for the last units: the baseline strategy locks the
+user usage row, then the account usage row, with `FOR NO KEY UPDATE`, reads both,
+checks the rules, and updates. Fixed lock order prevents deadlocks. The account
+row is the known hot spot, since every user in the account updates it. Plan
+edits and assignments lock the account row exclusively, while consumption holds
+a shared account lock, making each request observe a consistent committed plan.
 
 Optimization: a second strategy that skips the separate read and uses a conditional update (`UPDATE ... SET used = used + n WHERE used + n <= limit`) and checks the row count. A savepoint undoes the user increment if the account update fails, so the request record is still kept. The load test compares both strategies, so the README has a measured before-and-after.
 

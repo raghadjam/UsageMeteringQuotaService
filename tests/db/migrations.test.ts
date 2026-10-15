@@ -626,3 +626,206 @@ test("plans are account-scoped, predefined plans are read-only, and assignments 
   assert.equal(hiddenForeignUser.status, 404);
   assert.ok(otherUserResult.rows[0].id);
 });
+
+test("consume enforces both plan levels, replays idempotently, and serializes concurrent quota use", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const key = randomUUID() + randomUUID();
+  const accountPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('account', NULL, $1, 8, 5)
+     RETURNING id`,
+    [`Consume account ${randomUUID()}`],
+  );
+  const userPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', NULL, $1, 6, 3)
+     RETURNING id`,
+    [`Consume user ${randomUUID()}`],
+  );
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Consume test account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(key), accountPlan.rows[0].id],
+  );
+  const firstUser = await pool.query<{ id: string }>(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'quota-user', $2)
+     RETURNING id`,
+    [account.rows[0].id, userPlan.rows[0].id],
+  );
+  const otherUserPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', NULL, $1, 100, 10)
+     RETURNING id`,
+    [`Consume other user ${randomUUID()}`],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'account-limited-user', $2)`,
+    [account.rows[0].id, otherUserPlan.rows[0].id],
+  );
+
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+  const api = () => request(app).post("/v1/consume").set("X-API-Key", key);
+
+  const unauthenticated = await request(app)
+    .post("/v1/consume")
+    .send({ user_id: "quota-user", units: 1, request_id: "no-key" });
+  assert.equal(unauthenticated.status, 401);
+  const invalidUnits = await api().send({
+    user_id: "quota-user",
+    units: 1.5,
+    request_id: "fractional-units",
+  });
+  assert.equal(invalidUnits.status, 400);
+
+  const perRequestRejected = await api().send({
+    user_id: "quota-user",
+    units: 4,
+    request_id: "user-per-request",
+  });
+  assert.equal(perRequestRejected.status, 200);
+  assert.equal(perRequestRejected.body.accepted, false);
+  assert.deepEqual(perRequestRejected.body.rejected_by, {
+    level: "user",
+    rule: "per_request",
+  });
+  assert.equal(perRequestRejected.body.user.used, 0);
+
+  const replayedRejection = await api().send({
+    user_id: "quota-user",
+    units: 4,
+    request_id: "user-per-request",
+  });
+  assert.equal(replayedRejection.status, 200);
+  assert.equal(replayedRejection.body.replayed, true);
+  assert.equal(replayedRejection.body.accepted, false);
+  assert.deepEqual(
+    { ...replayedRejection.body, replayed: false },
+    perRequestRejected.body,
+  );
+  const idConflict = await api().send({
+    user_id: "quota-user",
+    units: 3,
+    request_id: "user-per-request",
+  });
+  assert.equal(idConflict.status, 409);
+  const userConflict = await api().send({
+    user_id: "account-limited-user",
+    units: 4,
+    request_id: "user-per-request",
+  });
+  assert.equal(userConflict.status, 409);
+
+  for (const requestId of ["accepted-one", "accepted-two"]) {
+    const accepted = await api().send({
+      user_id: "quota-user",
+      units: 3,
+      request_id: requestId,
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.accepted, true);
+    assert.equal(accepted.body.user.used, requestId === "accepted-one" ? 3 : 6);
+    assert.equal(accepted.body.account.used, requestId === "accepted-one" ? 3 : 6);
+  }
+
+  const userMonthlyRejected = await api().send({
+    user_id: "quota-user",
+    units: 1,
+    request_id: "user-monthly",
+  });
+  assert.equal(userMonthlyRejected.body.accepted, false);
+  assert.deepEqual(userMonthlyRejected.body.rejected_by, {
+    level: "user",
+    rule: "monthly_allowance",
+  });
+
+  const accountPerRequestRejected = await api().send({
+    user_id: "account-limited-user",
+    units: 6,
+    request_id: "account-per-request",
+  });
+  assert.equal(accountPerRequestRejected.body.accepted, false);
+  assert.deepEqual(accountPerRequestRejected.body.rejected_by, {
+    level: "account",
+    rule: "per_request",
+  });
+
+  const accountMonthlyRejected = await api().send({
+    user_id: "account-limited-user",
+    units: 3,
+    request_id: "account-monthly",
+  });
+  assert.equal(accountMonthlyRejected.body.accepted, false);
+  assert.deepEqual(accountMonthlyRejected.body.rejected_by, {
+    level: "account",
+    rule: "monthly_allowance",
+  });
+
+  const usage = await pool.query<{ account: string; user: string }>(
+    `SELECT au.units_used::text AS account, uu.units_used::text AS user
+     FROM account_usage au
+     JOIN user_usage uu ON uu.month = au.month
+     WHERE au.account_id = $1 AND uu.user_id = $2
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
+    [account.rows[0].id, firstUser.rows[0].id],
+  );
+  assert.deepEqual(usage.rows[0], { account: "6", user: "6" });
+
+  const concurrentAccountPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('account', NULL, $1, 5, 5)
+     RETURNING id`,
+    [`Concurrent account ${randomUUID()}`],
+  );
+  const concurrentUserPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', NULL, $1, 10, 1)
+     RETURNING id`,
+    [`Concurrent user ${randomUUID()}`],
+  );
+  const concurrentKey = randomUUID() + randomUUID();
+  const concurrentAccount = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Concurrent consume account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(concurrentKey), concurrentAccountPlan.rows[0].id],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'racing-user', $2)`,
+    [concurrentAccount.rows[0].id, concurrentUserPlan.rows[0].id],
+  );
+
+  const concurrentResults = await Promise.all(
+    Array.from({ length: 10 }, (_, index) =>
+      request(app)
+        .post("/v1/consume")
+        .set("X-API-Key", concurrentKey)
+        .send({
+          user_id: "racing-user",
+          units: 1,
+          request_id: `parallel-${index}`,
+        }),
+    ),
+  );
+  assert.ok(concurrentResults.every((result) => result.status === 200));
+  assert.equal(
+    concurrentResults.filter((result) => result.body.accepted).length,
+    5,
+  );
+
+  const concurrentUsage = await pool.query<{ account: string; user: string }>(
+    `SELECT au.units_used::text AS account, uu.units_used::text AS user
+     FROM account_usage au
+     JOIN users u ON u.account_id = au.account_id
+     JOIN user_usage uu ON uu.user_id = u.id AND uu.month = au.month
+     WHERE au.account_id = $1 AND u.external_id = 'racing-user'
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
+    [concurrentAccount.rows[0].id],
+  );
+  assert.deepEqual(concurrentUsage.rows[0], { account: "5", user: "5" });
+});
