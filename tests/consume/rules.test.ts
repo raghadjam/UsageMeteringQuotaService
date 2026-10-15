@@ -31,7 +31,7 @@ test("consume rejects in the specified account/user rule order", () => {
     8,
     { user: 0, account: 0 },
     { ...accountPlan, max_per_request: 7 },
-    userPlan,
+    { ...userPlan, max_per_request: 10 },
   );
   assert.deepEqual(accountPerRequest.rejected_by, {
     level: "account",

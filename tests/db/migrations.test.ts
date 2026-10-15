@@ -720,6 +720,7 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
   });
   assert.equal(userConflict.status, 409);
 
+  const originalAcceptedDecisions = new Map<string, object>();
   for (const requestId of ["accepted-one", "accepted-two"]) {
     const accepted = await api().send({
       user_id: "quota-user",
@@ -730,7 +731,20 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
     assert.equal(accepted.body.accepted, true);
     assert.equal(accepted.body.user.used, requestId === "accepted-one" ? 3 : 6);
     assert.equal(accepted.body.account.used, requestId === "accepted-one" ? 3 : 6);
+    originalAcceptedDecisions.set(requestId, accepted.body);
   }
+
+  const acceptedReplay = await api().send({
+    user_id: "quota-user",
+    units: 3,
+    request_id: "accepted-one",
+  });
+  assert.equal(acceptedReplay.status, 200);
+  assert.equal(acceptedReplay.body.replayed, true);
+  assert.deepEqual(
+    { ...acceptedReplay.body, replayed: false },
+    originalAcceptedDecisions.get("accepted-one"),
+  );
 
   const userMonthlyRejected = await api().send({
     user_id: "quota-user",
@@ -828,4 +842,52 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
     [concurrentAccount.rows[0].id],
   );
   assert.deepEqual(concurrentUsage.rows[0], { account: "5", user: "5" });
+
+  const idempotencyKey = randomUUID() + randomUUID();
+  const idempotencyAccount = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Concurrent idempotency account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(idempotencyKey), concurrentAccountPlan.rows[0].id],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'same-request-user', $2)`,
+    [idempotencyAccount.rows[0].id, concurrentUserPlan.rows[0].id],
+  );
+  const duplicateRequestResults = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      request(app)
+        .post("/v1/consume")
+        .set("X-API-Key", idempotencyKey)
+        .send({
+          user_id: "same-request-user",
+          units: 1,
+          request_id: "same-concurrent-id",
+        }),
+    ),
+  );
+  assert.ok(duplicateRequestResults.every((result) => result.status === 200));
+  assert.equal(
+    duplicateRequestResults.filter((result) => result.body.replayed === false).length,
+    1,
+  );
+  assert.ok(duplicateRequestResults.every((result) => result.body.accepted));
+  const firstDecision = {
+    ...duplicateRequestResults[0].body,
+    replayed: false,
+  };
+  for (const result of duplicateRequestResults) {
+    assert.deepEqual({ ...result.body, replayed: false }, firstDecision);
+  }
+  const idempotentUsage = await pool.query<{ account: string; user: string }>(
+    `SELECT au.units_used::text AS account, uu.units_used::text AS user
+     FROM account_usage au
+     JOIN users u ON u.account_id = au.account_id
+     JOIN user_usage uu ON uu.user_id = u.id AND uu.month = au.month
+     WHERE au.account_id = $1 AND u.external_id = 'same-request-user'
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
+    [idempotencyAccount.rows[0].id],
+  );
+  assert.deepEqual(idempotentUsage.rows[0], { account: "1", user: "1" });
 });

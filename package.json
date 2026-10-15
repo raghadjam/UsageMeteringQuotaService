@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "db:migrate": "tsx --env-file=.env src/db/runMigrations.ts",
-    "test": "tsx --test tests/api/auth.test.ts tests/db/migrations.test.ts",
+    "test": "tsx --test tests/api/auth.test.ts tests/consume/rules.test.ts tests/db/migrations.test.ts",
     "test:db": "tsx --test tests/db/*.test.ts"
   },
   "engines": {
