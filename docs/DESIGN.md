@@ -1,6 +1,6 @@
 # Usage Metering and Quota Service: Design
 
-Status: implementation in progress. The core API, schema and migrations, predefined plans, account-scoped user and custom-plan management, transactional consumption with selectable locking and conditional strategies, usage and request history, Docker Compose stack, CLI demo, and reproducible k6 load test are implemented. Locking and conditional strategy results are recorded in the README; this local sample did not show a consistent conditional-strategy performance improvement. Sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: the required service, Compose demo, automated tests, and reproducible performance benchmark are implemented. The locking and conditional strategies are selectable. Local benchmark results and limitations are documented in the README; they do not show a consistent performance win for the conditional strategy.
 
 ## 1. Overview
 
@@ -95,9 +95,7 @@ Plan ownership (a custom plan must belong to the same account) is enforced in se
 
 Account API keys contain 256 random bits, are returned only at account creation, and are stored as SHA-256 hashes. Hashing is appropriate here because randomly generated keys have high entropy and cannot feasibly be recovered from their digest.
 
-TODO: ER diagram in `docs/`.
-
-TODO: when the daily allowance is added, the usage tables get a period kind (`month` or `day`) in the key. Decide the exact shape at that point.
+An ER diagram is omitted; the tables and relationships are described above and defined by the SQL migration.
 
 ## 5. API
 
@@ -150,8 +148,7 @@ An accepted request has the same shape with `accepted: true` and no `rejected_by
 | 200 / 201 | Success (201 for creates). A rejected consume is also 200. |
 | 400 | Invalid body: units not a positive integer, missing request ID, bad month format |
 | 401 | Missing or invalid API key |
-| 403 | Trying to edit a predefined plan |
-| 404 | Unknown user or plan, or one that belongs to another account |
+| 404 | Unknown or inaccessible resource, including unknown users/plans, cross-account resources, and predefined plans on update |
 | 409 | Request ID reused with a different user or units, duplicate user external ID, duplicate plan name |
 
 Errors share one shape: `{ "error": { "code": "request_id_conflict", "message": "..." } }`. The `code` is for programs, the message is for humans.
@@ -181,7 +178,7 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 3. Claim the request: insert (account_id, request_id, user, units) with `ON CONFLICT DO NOTHING`.
 4. If the insert did nothing, the ID is already claimed. Read the stored row. Same user and units: return the stored decision with `replayed: true`. Different user or units: return 409.
 5. Make sure this month's usage rows exist (insert with `ON CONFLICT DO NOTHING`, units_used = 0).
-6. Call the locking strategy: check the rules and update the usage rows. The
+6. Call the configured consumption strategy to check the rules and update the usage rows. The
    account and user rows are held with shared locks to synchronize with plan
    edits and assignments; usage lock order is always user first, then account.
 7. Write the outcome and the decision JSON to the request row, commit.
@@ -189,7 +186,7 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 
 A crash or error before commit rolls back everything, including the claimed ID, so a retry starts clean. No `isProcessed` flag is needed because the whole decision is one database transaction. A flag would be needed only if processing involved external side effects.
 
-TODO: sequence diagram in `docs/`.
+The sequence is described above; a separate sequence diagram is omitted.
 
 ## 7. Rules
 
@@ -197,15 +194,11 @@ TODO: sequence diagram in `docs/`.
 |---|---|---|
 | Monthly allowance | account and user | Total units in a UTC calendar month |
 | Max per request | account and user | Largest amount in a single request |
-| Daily allowance | account and user (planned) | Total units in a UTC day. Empty means no daily cap. Built last, after the core works |
 
 Rejection order when several rules fail: user per-request, account per-request,
-user monthly, account monthly, user daily, account daily. Implemented rules use
-the first four checks; daily allowance remains planned.
+user monthly, then account monthly.
 
 Remaining is `max(0, limit - used)` and never negative. A request must pass every rule at both levels. A rejection consumes nothing at either level.
-
-TODO: confirm how the daily allowance appears in `remaining` (the lower of the daily and monthly remainders is my suggestion).
 
 ## 8. Plan changes
 
@@ -228,9 +221,9 @@ row is the known hot spot, since every user in the account updates it. Plan
 edits and assignments lock the account row exclusively, while consumption holds
 a shared account lock, making each request observe a consistent committed plan.
 
-Optimization: the selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. Correctness tests cover concurrent account and user monthly limits and concurrent duplicate IDs under the conditional path.
+The selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. PostgreSQL integration tests cover concurrent account and user monthly limits and concurrent duplicate IDs under the conditional path. The recorded benchmark did not establish a consistent performance improvement; see the README.
 
-Other levers if needed: keep transactions short, lower fillfactor on the usage tables, collapse the decision into fewer round trips.
+The API pool size is configurable with `DB_POOL_MAX` (default 50, allowed 1–100). Pool size alone does not remove contention on an account's shared usage row. Further query and transaction tuning should be guided by profiling.
 
 Rejected alternatives, one line each:
 
@@ -244,12 +237,9 @@ Rejected alternatives, one line each:
 | Advisory lock per account | Same hold time as row locking with no benefit |
 | Append-only ledger with SUM | Does not remove the race and gets slower as history grows |
 
-Initial locking-strategy results and the later controlled comparison are recorded in the README's performance section. In the controlled comparison, 20 VUs ran for 30 seconds, twice for each strategy and account layout. The accounting audit after all four runs returned no mismatches. Conditional throughput averaged 2.6% below locking for one account and 5.3% above locking for ten accounts; latency results varied, so this sample does not establish a general performance win. Rare requests reached about 15 seconds even though p99 was under 180 ms. The host resource allocation was not recorded.
+The pool-50 benchmark matrix and earlier baseline are recorded in the README. The matrix used 20, 50, and 100 VUs, 10 or 100 accounts, and three repeats per configuration. The accounting audit found no mismatches. Results showed throughput flattening near 500 requests/second for the tested 10-account cases as VUs increased; the conditional strategy did not consistently outperform locking. Docker CPU samples showed PostgreSQL using more CPU than the API, without saturating the 12-vCPU host. These are local measurements, not a capacity guarantee.
 
-The k6 script now measures consume-only throughput and p95/p99 latency, apart from its account/user provisioning calls. Compare both strategies with the same concurrency, duration, account count and Docker resources. After every run, check correctness: usage totals must equal accepted units. Record throughput, p95/p99 latency, accepted rate, failed requests, and the accounting-check result.
-
-TODO: connection pool size (must not be smaller than the test's concurrency, or queueing will hide the database result).
-TODO: lock timeout value, and the error code and status for a request that times out (suggestion: 503 with code `busy`).
+The k6 script measures consume-only throughput and p95/p99 latency, apart from account/user provisioning. Reproducible commands, per-run CSV, results, and caveats are in the README.
 
 ## 10. Failure scenarios
 
@@ -260,10 +250,10 @@ TODO: lock timeout value, and the error code and status for a request that times
 | Plan edited during a request | The request uses the plan it read under its locks, and the edit applies to the next one. Never half-applied |
 | Retry after a month rollover | Replays the stored decision from the original month, no recount |
 | Same request ID, different user or units | 409, nothing changes |
-| Lock wait too long | TODO |
-| Database unavailable | TODO |
+| Lock wait too long | No application-specific lock timeout is configured; behavior follows PostgreSQL/server defaults. |
+| Database unavailable | Requests surface an internal server error; the health endpoint returns an error and Docker marks the API unhealthy. |
 
-## 11. Product assumptions (draft)
+## 11. Product assumptions
 
 1. A rejected request is final. Retrying the same ID replays the rejection. To try again, use a new ID.
 2. The same request ID with a different user or units is a caller bug and returns 409.
@@ -271,22 +261,20 @@ TODO: lock timeout value, and the error code and status for a request that times
 4. Request IDs are unique per account, not globally.
 5. Past months report consumed units only. `remaining` is computed only for the current month, against current limits.
 6. A user or plan belonging to another account returns 404, so existence is not revealed.
-7. A business rejection returns 200 with `accepted: false`. Error statuses are for broken requests, so clients that auto-retry 4xx or 429 do not hammer the service.
-8. Predefined plans have no daily allowance. The numbers below are examples.
+7. A business rejection returns 200 with `accepted: false`; callers should inspect that field rather than treating every 200 response as accepted.
+8. The service meters one resource, in whole-number units.
 9. API keys are random, shown once, and stored only as a hash.
 10. Units and plan limits are capped at `Number.MAX_SAFE_INTEGER` (`9007199254740991`). The API uses JSON numbers, so accepting larger integers could silently lose precision in JavaScript. PostgreSQL stores them as `BIGINT`, and the schema enforces the same bound.
 
-## 12. Design decisions and tradeoffs (draft)
-
-Write each in your own words.
+## 12. Design decisions and tradeoffs
 
 **Insert-first idempotency, no isProcessed flag.** The challenge is two identical requests at once. Claiming the ID as the first step inside the transaction makes the database serialize them. Gained: units are counted once, nothing stuck after a crash, no "in progress" state for callers. Traded: a duplicate waits briefly while the first finishes.
 
-**Row locking baseline, conditional update optimization.** The challenge is two requests racing for the last units. Locking is exact and easy to trace, and it makes the reason for a rejection easy to report. Gained: correctness and explainability. Traded: lock held across several round trips, which the conditional strategy reduces.
+**Row locking baseline, conditional update alternative.** The locking strategy is the default because it is straightforward and returns precise rejection reasons. Conditional updates try to reduce reads on accepted requests while retaining transactionality; failed conditional updates roll back to a savepoint and use locking to classify the rejection. The local benchmark did not establish a consistent speed advantage, so the alternative remains opt-in.
 
 **Usage rows instead of summing history.** Reading a stored total is instant and gives a row to lock. Traded: two writes per accepted request, both committed with the history row.
 
-**Plans as columns, referenced by ID.** Edits take effect immediately without a redeploy. Traded: adding rules means adding columns, acceptable for two required rules plus the daily allowance.
+**Plans as columns, referenced by ID.** Edits take effect immediately without a redeploy. Adding a new rule type would require extending the schema and evaluation logic.
 
 **JSON decision snapshot on request rows.** Replays are exact and past rejections stay explainable after a plan changes. Traded: values inside the JSON are not indexed, so queryable fields stay as plain columns.
 
@@ -296,22 +284,14 @@ Write each in your own words.
 
 ## 13. Known limitations
 
-- A single Postgres means one account's throughput is capped by its hot usage row. Initial local results suggest contention, but their variability and unrecorded host resources prevent using them as a capacity guarantee.
+- A single Postgres means an account's shared usage row is a serialization point. Local benchmarks show throughput flattening under higher concurrency; results are specific to the tested machine and are not a capacity guarantee.
 - Direct database writes could bypass the plan ownership check.
 - Past-month `remaining` is not reported.
-- TODO: add more after testing.
+- No application-specific lock-wait timeout or dedicated database-unavailable response has been implemented.
 
-## 14. Test plan
+## 14. Verification coverage
 
-- API key validation: missing, invalid, valid
-- Account isolation: another account's users, plans and requests return 404
-- Replay and conflict: same ID returns the stored decision, different payload returns 409
-- 20 identical requests in parallel: usage increases once, one row exists, all responses match
-- Many users racing for the last units of an account: totals never exceed the limit
-- Plan changes mid-month: usage preserved, reduced allowance shows remaining 0, history unchanged
-- Month rollover: new month starts at zero, old months still queryable
-- Both strategies produce identical decisions on the same scenarios
-- Daily allowance, including the midnight UTC boundary (if built)
+Automated tests cover API key validation, account isolation, idempotent replay and conflict, concurrent quota enforcement, plan changes, and both consumption strategies. The k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Manual API checks can additionally verify month rollover and historical queries.
 
 ## 15. Predefined plans and the demo
 
@@ -324,19 +304,10 @@ Write each in your own words.
 
 Premium's monthly allowance equals Starter's, so one Premium user can use up the whole account allowance. That makes an account-level rejection possible while the user's own limits are fine.
 
-Example client scenario, with account Acme on Starter, Sara on Basic and Omar on Premium:
+The runnable Compose client creates users on different plans, demonstrates accepted and rejected consumption, changes plan limits, and demonstrates the effect without changing the consume request. See the README's Compose instructions for how to run it.
 
-1. Sara consumes 10. Accepted.
-2. Sara consumes 25. Rejected by her per-request limit (20), though both monthly allowances have room.
-3. Omar consumes 100 nine times, with nine different request IDs. All accepted. Account usage is 910, Omar's is 900.
-4. Omar consumes 100 again. His own limits allow it, but the account has only 90 left. Rejected by the account monthly allowance.
-5. The client switches Acme to Pro through the API. Omar sends 100 with a new request ID. Accepted. The client code is unchanged.
-6. Optionally switch Sara to Premium and a 25-unit request is accepted.
+## 16. Follow-up considerations
 
-Step 5 uses a new ID because replaying the rejected ID would return the stored rejection.
-
-## 16. Open questions
-
-- TODO: lock timeout, pool size
-- TODO: exact bodies for the plan and user endpoints
-- TODO: confirm the daily allowance is in scope after the core is working
+- Consider an explicit lock timeout and documented retryable response if deployment requirements call for bounded lock waits.
+- Profile database queries and transaction timings before attempting further performance changes.
+- If a new quota rule is required, define its period, reset behavior, decision order, schema, history snapshot, and response semantics before implementing it.
