@@ -6,6 +6,7 @@ import { createPlansRouter } from "./routes/plans";
 import { createConsumeRouter } from "./routes/consume";
 import { createUsageRouter } from "./routes/usage";
 import { createRequestsRouter } from "./routes/requests";
+import { createHealthRouter } from "./routes/health";
 import { errorHandler } from "./middleware/errorHandler";
 
 export interface AppDependencies {
@@ -16,6 +17,7 @@ export interface AppDependencies {
 export function createApp({ pool, adminApiKey }: AppDependencies): express.Express {
   const app = express();
   app.use(express.json({ limit: "16kb" }));
+  app.use("/v1", createHealthRouter(pool));
   app.use("/v1", createAccountsRouter(pool, adminApiKey));
   app.use("/v1", createUsersRouter(pool));
   app.use("/v1", createPlansRouter(pool));

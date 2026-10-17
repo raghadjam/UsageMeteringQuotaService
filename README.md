@@ -31,7 +31,40 @@ isolated temporary schema and remove it after the run:
 npm run test:db
 ```
 
-## Run the service
+## Run the full stack with Docker Compose
+
+Prerequisites: Docker Desktop (or Docker Engine) with the Compose plugin.
+Compose starts PostgreSQL and the API, waits for both health checks, then runs
+the example CLI client. The client creates an account, demonstrates acceptance
+and user/account quota rejections, changes the plans, and demonstrates that the
+same kind of request is accepted after the changes.
+
+```powershell
+Copy-Item .env.example .env
+# Optional: edit .env to replace the local-only passwords and admin key.
+docker compose up --build
+```
+
+The API is available at `http://localhost:3000`; PostgreSQL is kept in the
+`postgres_data` named volume. The demo client exits when its walkthrough
+finishes, while the database and API stay running. It creates a new demo
+account on each run. Run the walkthrough again with:
+
+```powershell
+docker compose run --rm demo-client
+```
+
+Check service readiness at `http://localhost:3000/v1/health`. Stop the stack
+while preserving database contents with `docker compose down`. To also remove
+the local database and all its data, run `docker compose down -v`.
+
+Compose reads `.env` automatically. Its default keys and passwords are only
+for local development; replace them before exposing the service. If you change
+the database name, username, or password, update the corresponding values in
+`.env` together. Keep the password URI-safe for the Compose-built
+`DATABASE_URL`.
+
+## Run the service without Docker
 
 Set `DATABASE_URL` and an admin secret of at least 32 characters:
 
@@ -41,8 +74,8 @@ $env:ADMIN_API_KEY = "replace-with-a-random-secret-at-least-32-characters"
 npm run dev
 ```
 
-Copy `.env.example` to `.env` and replace the sample credentials for local
-development. Do not commit real credentials.
+Set `DATABASE_URL` and `ADMIN_API_KEY` in your shell as above. Do not commit
+real credentials.
 
 `npm start` runs the compiled server after `npm run build`. The service listens
 on port 3000 by default; set `PORT` to change it.
@@ -194,5 +227,5 @@ History pages include the stored decision snapshot, rejection level/rule,
 request ID, and timestamp. Replaying a request does not add another history
 entry.
 
-The example client, Docker Compose, and performance tests remain to be
-implemented.
+The Compose demo is implemented as a small CLI client in `client/demo.mjs`.
+Performance tests and measured results remain to be implemented.

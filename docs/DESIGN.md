@@ -1,6 +1,6 @@
 # Usage Metering and Quota Service: Design
 
-Status: implementation in progress. The initial schema, repeatable migration runner, predefined plan seed, account creation, account API-key authentication, account-scoped user management, custom plan management, and plan assignments are implemented. Other sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: implementation in progress. The core API, schema and migrations, predefined plans, account-scoped user and custom-plan management, transactional consumption, usage and request history, Docker Compose stack, and CLI demo are implemented. Performance testing and measured results remain open, along with the sections marked `TODO`. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
 
 ## 1. Overview
 
