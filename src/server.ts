@@ -3,18 +3,25 @@ import { createApp } from "./app";
 import { loadConfig } from "./config";
 import { runMigrations } from "./db/migrate";
 import { createPool } from "./db/pool";
+import { lockingStrategy } from "./consume/lockingStrategy";
+import { conditionalStrategy } from "./consume/conditionalStrategy";
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const pool = createPool(config.databaseUrl);
+  const pool = createPool(config.databaseUrl, config.databasePoolMax);
 
   try {
     await runMigrations(pool);
+    const consumptionStrategy = config.consumptionStrategy === "conditional"
+      ? conditionalStrategy
+      : lockingStrategy;
     const server = createServer(
-      createApp({ pool, adminApiKey: config.adminApiKey }),
+      createApp({ pool, adminApiKey: config.adminApiKey, consumptionStrategy }),
     );
     server.listen(config.port, () => {
-      console.log(`Usage metering service listening on port ${config.port}`);
+      console.log(
+        `Usage metering service listening on port ${config.port} with ${config.consumptionStrategy} consumption`,
+      );
     });
 
     const shutdown = (): void => {

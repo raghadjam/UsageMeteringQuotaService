@@ -4,3 +4,5 @@ dist/
 *.log
 coverage/
 loadtest/results/tmp/
+loadtest/results/*.json
+loadtest/results/*docker-stats.csv

@@ -24,6 +24,8 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-usage_metering}:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/${POSTGRES_DB:-usage_metering}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-local-compose-admin-key-change-this}
+      CONSUMPTION_STRATEGY: ${CONSUMPTION_STRATEGY:-locking}
+      DB_POOL_MAX: ${DB_POOL_MAX:-50}
       PORT: 3000
     ports:
       - "${API_PORT:-3000}:3000"
@@ -53,6 +55,22 @@ services:
       api:
         condition: service_healthy
     restart: "no"
+
+  k6:
+    image: grafana/k6:0.55.0
+    profiles: ["loadtest"]
+    environment:
+      API_URL: http://api:3000/v1
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-local-compose-admin-key-change-this}
+      VUS: ${VUS:-20}
+      DURATION: ${DURATION:-30s}
+      ACCOUNTS: ${ACCOUNTS:-1}
+    volumes:
+      - ./loadtest:/scripts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    entrypoint: ["k6"]
 
 volumes:
   postgres_data:

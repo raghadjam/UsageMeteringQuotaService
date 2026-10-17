@@ -5,6 +5,7 @@ import { after, before, test } from "node:test";
 import { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "../../src/app";
+import { conditionalStrategy } from "../../src/consume/conditionalStrategy";
 import { hashApiKey } from "../../src/middleware/auth";
 import { runMigrations } from "../../src/db/migrate";
 
@@ -890,6 +891,223 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
     [idempotencyAccount.rows[0].id],
   );
   assert.deepEqual(idempotentUsage.rows[0], { account: "1", user: "1" });
+});
+
+test("conditional strategy preserves quota limits, request replays, and usage totals under concurrency", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const key = randomUUID() + randomUUID();
+  const accountPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('account', NULL, $1, 7, 5)
+     RETURNING id`,
+    [`Conditional account ${randomUUID()}`],
+  );
+  const userPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', NULL, $1, 100, 10)
+     RETURNING id`,
+    [`Conditional user ${randomUUID()}`],
+  );
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Conditional strategy account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(key), accountPlan.rows[0].id],
+  );
+  for (const externalId of ["conditional-user-a", "conditional-user-b"]) {
+    await pool.query(
+      `INSERT INTO users (account_id, external_id, plan_id)
+       VALUES ($1, $2, $3)`,
+      [account.rows[0].id, externalId, userPlan.rows[0].id],
+    );
+  }
+
+  const app = createApp({
+    pool,
+    adminApiKey: "a".repeat(32),
+    consumptionStrategy: conditionalStrategy,
+  });
+  const api = (userId: string, requestId: string) =>
+    request(app)
+      .post("/v1/consume")
+      .set("X-API-Key", key)
+      .send({ user_id: userId, units: 1, request_id: requestId });
+
+  const userPerRequestRejected = await request(app)
+    .post("/v1/consume")
+    .set("X-API-Key", key)
+    .send({
+      user_id: "conditional-user-a",
+      units: 11,
+      request_id: "conditional-user-per-request",
+    });
+  assert.equal(userPerRequestRejected.status, 200);
+  assert.equal(userPerRequestRejected.body.accepted, false);
+  assert.deepEqual(userPerRequestRejected.body.rejected_by, {
+    level: "user",
+    rule: "per_request",
+  });
+
+  const accountPerRequestRejected = await request(app)
+    .post("/v1/consume")
+    .set("X-API-Key", key)
+    .send({
+      user_id: "conditional-user-a",
+      units: 6,
+      request_id: "conditional-account-per-request",
+    });
+  assert.equal(accountPerRequestRejected.status, 200);
+  assert.equal(accountPerRequestRejected.body.accepted, false);
+  assert.deepEqual(accountPerRequestRejected.body.rejected_by, {
+    level: "account",
+    rule: "per_request",
+  });
+
+  const duplicateResults = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      api("conditional-user-a", "conditional-shared-request"),
+    ),
+  );
+  assert.ok(duplicateResults.every((result) => result.status === 200));
+  assert.equal(
+    duplicateResults.filter((result) => result.body.replayed === false).length,
+    1,
+  );
+  assert.ok(duplicateResults.every((result) => result.body.accepted));
+
+  const competingResults = await Promise.all(
+    Array.from({ length: 20 }, (_, index) =>
+      api(
+        index % 2 === 0 ? "conditional-user-a" : "conditional-user-b",
+        `conditional-competing-${index}`,
+      ),
+    ),
+  );
+  assert.ok(competingResults.every((result) => result.status === 200));
+  assert.equal(
+    competingResults.filter((result) => result.body.accepted).length,
+    6,
+  );
+  assert.ok(
+    competingResults
+      .filter((result) => !result.body.accepted)
+      .every((result) =>
+        result.body.rejected_by.level === "account" &&
+        result.body.rejected_by.rule === "monthly_allowance"
+      ),
+  );
+  const rejectedIndex = competingResults.findIndex(
+    (result) => !result.body.accepted,
+  );
+  assert.notEqual(rejectedIndex, -1);
+  const rejectedReplay = await api(
+    rejectedIndex % 2 === 0 ? "conditional-user-a" : "conditional-user-b",
+    `conditional-competing-${rejectedIndex}`,
+  );
+  assert.equal(rejectedReplay.status, 200);
+  assert.equal(rejectedReplay.body.replayed, true);
+  assert.equal(rejectedReplay.body.accepted, false);
+  assert.deepEqual(
+    { ...rejectedReplay.body, replayed: false },
+    competingResults[rejectedIndex].body,
+  );
+
+  const usage = await pool.query<{
+    account: string;
+    users: string;
+    accepted_requests: string;
+  }>(
+    `SELECT au.units_used::text AS account,
+            SUM(uu.units_used)::text AS users,
+            (SELECT COALESCE(SUM(r.units), 0)::text
+             FROM requests r
+             WHERE r.account_id = a.id AND r.outcome = 'accepted') AS accepted_requests
+     FROM accounts a
+     JOIN account_usage au ON au.account_id = a.id
+     JOIN users u ON u.account_id = a.id
+     JOIN user_usage uu ON uu.user_id = u.id AND uu.month = au.month
+     WHERE a.id = $1
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date
+     GROUP BY a.id, au.units_used`,
+    [account.rows[0].id],
+  );
+  assert.deepEqual(usage.rows[0], {
+    account: "7",
+    users: "7",
+    accepted_requests: "7",
+  });
+});
+
+test("conditional strategy enforces per-user monthly limits under concurrent consumption", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const key = randomUUID() + randomUUID();
+  const accountPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('account', NULL, $1, 100, 10)
+     RETURNING id`,
+    [`Conditional user-limit account ${randomUUID()}`],
+  );
+  const userPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', NULL, $1, 3, 10)
+     RETURNING id`,
+    [`Conditional user-limit plan ${randomUUID()}`],
+  );
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Conditional user-limit account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(key), accountPlan.rows[0].id],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'conditional-limited-user', $2)`,
+    [account.rows[0].id, userPlan.rows[0].id],
+  );
+
+  const app = createApp({
+    pool,
+    adminApiKey: "a".repeat(32),
+    consumptionStrategy: conditionalStrategy,
+  });
+  const results = await Promise.all(
+    Array.from({ length: 10 }, (_, index) =>
+      request(app)
+        .post("/v1/consume")
+        .set("X-API-Key", key)
+        .send({
+          user_id: "conditional-limited-user",
+          units: 1,
+          request_id: `conditional-user-race-${index}`,
+        }),
+    ),
+  );
+
+  assert.ok(results.every((result) => result.status === 200));
+  assert.equal(results.filter((result) => result.body.accepted).length, 3);
+  assert.ok(
+    results
+      .filter((result) => !result.body.accepted)
+      .every((result) =>
+        result.body.rejected_by.level === "user" &&
+        result.body.rejected_by.rule === "monthly_allowance"
+      ),
+  );
+
+  const usage = await pool.query<{ account: string; user: string }>(
+    `SELECT au.units_used::text AS account, uu.units_used::text AS user
+     FROM account_usage au
+     JOIN users u ON u.account_id = au.account_id
+     JOIN user_usage uu ON uu.user_id = u.id AND uu.month = au.month
+     WHERE au.account_id = $1 AND u.external_id = 'conditional-limited-user'
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
+    [account.rows[0].id],
+  );
+  assert.deepEqual(usage.rows[0], { account: "3", user: "3" });
 });
 
 test("usage summaries and request history are filtered, paginated, and account-scoped", {

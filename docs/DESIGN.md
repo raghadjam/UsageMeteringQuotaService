@@ -1,12 +1,12 @@
 # Usage Metering and Quota Service: Design
 
-Status: implementation in progress. The core API, schema and migrations, predefined plans, account-scoped user and custom-plan management, transactional consumption, usage and request history, Docker Compose stack, and CLI demo are implemented. Performance testing and measured results remain open, along with the sections marked `TODO`. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
+Status: implementation in progress. The core API, schema and migrations, predefined plans, account-scoped user and custom-plan management, transactional consumption with selectable locking and conditional strategies, usage and request history, Docker Compose stack, CLI demo, and reproducible k6 load test are implemented. Locking and conditional strategy results are recorded in the README; this local sample did not show a consistent conditional-strategy performance improvement. Sections marked `TODO` remain open. Sections 11 and 12 are written as a first pass and should be rewritten in your own words, because you will be asked about them.
 
 ## 1. Overview
 
 A backend service that other applications call before doing something costly. The caller asks "can this user consume N units?", and the service checks the account's plan and the user's plan together, records the decision, and counts the usage if the request is accepted. It does the accounting and the decision, not the actual work.
 
-Stack: Node (current LTS), TypeScript, Express 5, Zod for validation, `pg` with plain SQL, PostgreSQL. Tests use Vitest and supertest against a real Postgres. Load tests use k6.
+Stack: Node (current LTS), TypeScript, Express 5, Zod for validation, `pg` with plain SQL, PostgreSQL. Tests use the Node test runner and supertest against PostgreSQL. Load tests use k6.
 
 Out of scope, per the brief: billing, payments, refunds, multiple resource types, end-user login, role-based permissions, distributed infrastructure.
 
@@ -228,7 +228,7 @@ row is the known hot spot, since every user in the account updates it. Plan
 edits and assignments lock the account row exclusively, while consumption holds
 a shared account lock, making each request observe a consistent committed plan.
 
-Optimization: a second strategy that skips the separate read and uses a conditional update (`UPDATE ... SET used = used + n WHERE used + n <= limit`) and checks the row count. A savepoint undoes the user increment if the account update fails, so the request record is still kept. The load test compares both strategies, so the README has a measured before-and-after.
+Optimization: the selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. Correctness tests cover concurrent account and user monthly limits and concurrent duplicate IDs under the conditional path.
 
 Other levers if needed: keep transactions short, lower fillfactor on the usage tables, collapse the decision into fewer round trips.
 
@@ -244,7 +244,9 @@ Rejected alternatives, one line each:
 | Advisory lock per account | Same hold time as row locking with no benefit |
 | Append-only ledger with SUM | Does not remove the race and gets slower as history grows |
 
-Load test plan: k6, run from its Docker image. Two scenarios: many users under one account (worst case contention) and users spread across many accounts (no contention). Record throughput, p50 and p99 latency, and accepted versus rejected counts. After every run, check correctness: usage totals must equal the sum of accepted units.
+Initial locking-strategy results and the later controlled comparison are recorded in the README's performance section. In the controlled comparison, 20 VUs ran for 30 seconds, twice for each strategy and account layout. The accounting audit after all four runs returned no mismatches. Conditional throughput averaged 2.6% below locking for one account and 5.3% above locking for ten accounts; latency results varied, so this sample does not establish a general performance win. Rare requests reached about 15 seconds even though p99 was under 180 ms. The host resource allocation was not recorded.
+
+The k6 script now measures consume-only throughput and p95/p99 latency, apart from its account/user provisioning calls. Compare both strategies with the same concurrency, duration, account count and Docker resources. After every run, check correctness: usage totals must equal accepted units. Record throughput, p95/p99 latency, accepted rate, failed requests, and the accounting-check result.
 
 TODO: connection pool size (must not be smaller than the test's concurrency, or queueing will hide the database result).
 TODO: lock timeout value, and the error code and status for a request that times out (suggestion: 503 with code `busy`).
@@ -294,7 +296,7 @@ Write each in your own words.
 
 ## 13. Known limitations
 
-- A single Postgres means one account's throughput is capped by its hot usage row. The measured ceiling goes here after the load test (TODO).
+- A single Postgres means one account's throughput is capped by its hot usage row. Initial local results suggest contention, but their variability and unrecorded host resources prevent using them as a capacity guarantee.
 - Direct database writes could bypass the plan ownership check.
 - Past-month `remaining` is not reported.
 - TODO: add more after testing.

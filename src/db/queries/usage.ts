@@ -207,6 +207,42 @@ export async function incrementUsage(
   };
 }
 
+export async function incrementUserUsageWithinAllowance(
+  client: PoolClient,
+  userId: string,
+  month: string,
+  units: number,
+  allowance: number,
+): Promise<string | undefined> {
+  const result = await client.query<{ units_used: string }>(
+    `UPDATE user_usage
+     SET units_used = units_used + $3
+     WHERE user_id = $1 AND month = $2
+       AND units_used <= $4::bigint - $3::bigint
+     RETURNING units_used::text AS units_used`,
+    [userId, month, units, allowance],
+  );
+  return result.rows[0]?.units_used;
+}
+
+export async function incrementAccountUsageWithinAllowance(
+  client: PoolClient,
+  accountId: string,
+  month: string,
+  units: number,
+  allowance: number,
+): Promise<string | undefined> {
+  const result = await client.query<{ units_used: string }>(
+    `UPDATE account_usage
+     SET units_used = units_used + $3
+     WHERE account_id = $1 AND month = $2
+       AND units_used <= $4::bigint - $3::bigint
+     RETURNING units_used::text AS units_used`,
+    [accountId, month, units, allowance],
+  );
+  return result.rows[0]?.units_used;
+}
+
 export async function readUsageAmounts(
   client: PoolClient,
   accountId: string,

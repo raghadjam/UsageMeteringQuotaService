@@ -2,6 +2,8 @@ export interface AppConfig {
   databaseUrl: string;
   adminApiKey: string;
   port: number;
+  databasePoolMax: number;
+  consumptionStrategy: "locking" | "conditional";
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -25,5 +27,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error("PORT must be a valid integer between 1 and 65535");
   }
 
-  return { databaseUrl, adminApiKey, port };
+  const databasePoolMaxValue = env.DB_POOL_MAX ?? "50";
+  if (!/^\d+$/.test(databasePoolMaxValue)) {
+    throw new Error("DB_POOL_MAX must be an integer between 1 and 100");
+  }
+  const databasePoolMax = Number(databasePoolMaxValue);
+  if (!Number.isSafeInteger(databasePoolMax) || databasePoolMax < 1 || databasePoolMax > 100) {
+    throw new Error("DB_POOL_MAX must be an integer between 1 and 100");
+  }
+
+  const consumptionStrategy = env.CONSUMPTION_STRATEGY ?? "locking";
+  if (consumptionStrategy !== "locking" && consumptionStrategy !== "conditional") {
+    throw new Error("CONSUMPTION_STRATEGY must be locking or conditional");
+  }
+
+  return {
+    databaseUrl,
+    adminApiKey,
+    port,
+    databasePoolMax,
+    consumptionStrategy,
+  };
 }

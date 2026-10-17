@@ -8,20 +8,27 @@ import { createUsageRouter } from "./routes/usage";
 import { createRequestsRouter } from "./routes/requests";
 import { createHealthRouter } from "./routes/health";
 import { errorHandler } from "./middleware/errorHandler";
+import type { ConsumptionStrategy } from "./consume/strategy";
+import { lockingStrategy } from "./consume/lockingStrategy";
 
 export interface AppDependencies {
   pool: Pool;
   adminApiKey: string;
+  consumptionStrategy?: ConsumptionStrategy;
 }
 
-export function createApp({ pool, adminApiKey }: AppDependencies): express.Express {
+export function createApp({
+  pool,
+  adminApiKey,
+  consumptionStrategy = lockingStrategy,
+}: AppDependencies): express.Express {
   const app = express();
   app.use(express.json({ limit: "16kb" }));
   app.use("/v1", createHealthRouter(pool));
   app.use("/v1", createAccountsRouter(pool, adminApiKey));
   app.use("/v1", createUsersRouter(pool));
   app.use("/v1", createPlansRouter(pool));
-  app.use("/v1", createConsumeRouter(pool));
+  app.use("/v1", createConsumeRouter(pool, consumptionStrategy));
   app.use("/v1", createUsageRouter(pool));
   app.use("/v1", createRequestsRouter(pool));
   app.use((_req, res) => {

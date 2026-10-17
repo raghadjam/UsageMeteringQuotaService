@@ -10,6 +10,7 @@ import {
 } from "../db/queries/usage";
 import { isConsumptionDecision, type ConsumptionDecision } from "./rules";
 import { lockingStrategy } from "./lockingStrategy";
+import type { ConsumptionStrategy } from "./strategy";
 
 interface ConsumptionUser {
   account_plan_id: string;
@@ -52,7 +53,11 @@ function serializeDecision(
   return { request_id: requestId, replayed, ...decision };
 }
 
-export async function consume(pool: Pool, input: ConsumeInput): Promise<ConsumeResult> {
+export async function consume(
+  pool: Pool,
+  input: ConsumeInput,
+  strategy: ConsumptionStrategy = lockingStrategy,
+): Promise<ConsumeResult> {
   const client = await pool.connect();
   let inTransaction = false;
 
@@ -144,7 +149,7 @@ export async function consume(pool: Pool, input: ConsumeInput): Promise<ConsumeR
     }
 
     await ensureUsageRows(client, input.accountId, user.user_id, month);
-    const decision = await lockingStrategy({
+    const decision = await strategy({
       client,
       accountId: input.accountId,
       userId: user.user_id,
