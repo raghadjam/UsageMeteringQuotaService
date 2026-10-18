@@ -240,7 +240,10 @@ so the current warm accepted path is 8 SQL statements. The warm count excludes
 API-key authentication, which is outside the transaction and is skipped on an
 API-key cache hit. A first request in a new UTC month has additional
 lock/insert/re-lock statements for the missing user and account usage rows.
-These are statement-count measurements, not evidence of higher throughput.
+The 7-statement count was verified with PostgreSQL logging before the timeout
+configuration was added; 8 is the resulting count by adding its one SQL
+statement, not a second independent log measurement. These are statement-count
+measurements, not evidence of higher throughput.
 
 The API pool size is configurable with `DB_POOL_MAX` (default 50, allowed 1–100). Pool size alone does not remove contention on an account's shared usage row. Further query and transaction tuning should be guided by profiling.
 

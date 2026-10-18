@@ -491,6 +491,9 @@ authentication lookup, which runs before the transaction and is skipped on a
 warm API-key cache hit. First requests in a new UTC month have extra statements
 to create and re-lock the missing user and account usage rows. Rejections do
 not run the combined usage CTE and still only write their request decision.
+The 7-statement count was verified from PostgreSQL logs before the timeout
+configuration was added; 8 is the derived current count, not a fresh log
+measurement.
 
 These are query-count results only. Throughput, p95/p99, pool-size comparisons,
 pg_stat_statements profiles, rejection-heavy and same-account/many-user
