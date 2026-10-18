@@ -338,7 +338,7 @@ The k6 script measures consume-only throughput and p95/p99 latency, apart from a
 
 ## 14. Verification coverage
 
-Automated tests cover API key validation and cache behavior, account isolation, a 20-request concurrent duplicate storm, idempotent replay and conflict, concurrent quota enforcement, plan changes, timeout rollback/response behavior, and decision parity between both consumption strategies. The previously recorded k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Performance results for the current query changes remain unmeasured in this environment.
+Automated tests cover API key validation and cache behavior, account isolation, a 20-request concurrent duplicate storm, idempotent replay and conflict, concurrent quota enforcement, ten-user consumption while plan assignments run concurrently, timeout rollback/response behavior, and decision parity between both consumption strategies. The previously recorded k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Performance results for the current query changes remain unmeasured in this environment.
 
 ## 15. Predefined plans and the demo
 

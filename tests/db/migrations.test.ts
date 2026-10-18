@@ -1317,6 +1317,83 @@ test("consume reports a locked account as busy and leaves no request claim", {
   }
 });
 
+test("parallel account users and plan assignments complete without deadlocks", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const key = randomUUID() + randomUUID();
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [`Plan concurrency account ${randomUUID()}`, hashApiKey(key), starterPlanId],
+  );
+  const externalIds = Array.from(
+    { length: 10 },
+    (_, index) => `plan-concurrency-${index}-${randomUUID()}`,
+  );
+  for (const externalId of externalIds) {
+    await pool.query(
+      `INSERT INTO users (account_id, external_id, plan_id)
+       VALUES ($1, $2, $3)`,
+      [account.rows[0].id, externalId, basicPlanId],
+    );
+  }
+
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+  const operations = [
+    ...externalIds.map((externalId) =>
+      request(app)
+        .put(`/v1/users/${encodeURIComponent(externalId)}/plan`)
+        .set("X-API-Key", key)
+        .send({ plan_id: basicPlanId }),
+    ),
+    ...externalIds.flatMap((externalId, index) =>
+      [0, 1].map((attempt) =>
+        request(app)
+          .post("/v1/consume")
+          .set("X-API-Key", key)
+          .send({
+            user_id: externalId,
+            units: 1,
+            request_id: `plan-concurrency-${index}-${attempt}`,
+          }),
+      ),
+    ),
+  ];
+  const results = await Promise.all(operations);
+  assert.ok(results.every((result) => result.status === 200));
+
+  const accounting = await pool.query<{
+    account_usage: string;
+    accepted_units: string;
+    user_usage: string;
+  }>(
+    `SELECT au.units_used::text AS account_usage,
+            COALESCE(SUM(uu.units_used), 0)::text AS user_usage,
+            (SELECT COALESCE(SUM(r.units), 0)::text
+             FROM requests r
+             WHERE r.account_id = a.id AND r.outcome = 'accepted') AS accepted_units
+     FROM accounts a
+     LEFT JOIN account_usage au
+       ON au.account_id = a.id
+      AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date
+     LEFT JOIN users u ON u.account_id = a.id
+     LEFT JOIN user_usage uu
+       ON uu.user_id = u.id
+      AND uu.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date
+     WHERE a.id = $1
+     GROUP BY a.id, au.units_used`,
+    [account.rows[0].id],
+  );
+  assert.deepEqual(accounting.rows[0], {
+    account_usage: "20",
+    accepted_units: "20",
+    user_usage: "20",
+  });
+});
+
 test("usage summaries and request history are filtered, paginated, and account-scoped", {
   skip: !connectionString,
 }, async () => {
