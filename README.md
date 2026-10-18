@@ -69,6 +69,22 @@ the database name, username, or password, update the corresponding values in
 the API. Keep the combined pool sizes of all API instances below PostgreSQL's
 `max_connections`.
 
+`CONSUME_LOCK_TIMEOUT_MS` and `CONSUME_STATEMENT_TIMEOUT_MS` set transaction-
+local PostgreSQL timeouts for consume requests (defaults 1000 ms and 30000 ms;
+allowed ranges 1–60000 ms and 1–120000 ms). The service acquires a
+pool connection before starting the transaction, so pool-queue time is not
+charged against either timeout. PostgreSQL lock timeout (`55P03`) and statement
+timeout (`57014`) errors alone map to HTTP 503 `busy`, with a `Retry-After`
+header; other database errors retain the regular internal-error behavior. These
+defaults were selected from repeated contention tests; the measurements are
+summarized below.
+
+If consume returns `503 busy`, the transaction has rolled back, including the
+request-ID claim and any usage changes. Retry with the **same `request_id`**,
+user, and units. A successful retry processes it normally; retrying after a
+committed response replays the stored decision. Do not generate a new ID merely
+because the service asked the caller to retry.
+
 `API_KEY_CACHE_ENABLED` enables the in-memory account-key lookup cache
 (default `true`; set to `false` to disable). Successful lookups are cached by
 API-key hash for 30 seconds, up to 10,000 entries per API process. Cache hits
@@ -245,13 +261,19 @@ The Compose demo is implemented as a small CLI client in `client/demo.mjs`.
 ## Performance test
 
 The k6 test provisions fresh accounts and users through the API, then sends
-concurrent one-unit consume requests. `ACCOUNTS=1` stresses the shared account
+concurrent consume requests. `ACCOUNTS=1` stresses the shared account
 usage row; using multiple accounts spreads virtual users across independent
-account rows. Each load-test account and user receives a high custom limit so
-the benchmark measures successful consumption and database contention instead
-of exhausting a quota. `consume_requests` and `consume_latency` report consume
-traffic only, excluding setup calls. The summary also reports accepted rate,
-HTTP errors, and latency percentiles through p99.
+account rows. `ALLOWANCE` sets the monthly limit for account and user plans,
+`UNITS` sets the amount per request, and `DUP_RATE` controls the fraction of
+iterations that resend the previous request ID from the same VU. Consume
+counters exclude account/user setup calls. Accepted and rejected counts
+represent fresh decisions; replays are counted separately. The summary also
+includes `consume_busy` (HTTP 503); busy responses are classified by
+`Retry-After` as lock timeout, statement timeout, or unclassified. These
+counts appear alongside request rate and p95/p99 latency.
+The default configuration checks that every request
+is accepted; alternate workload modes validate only a valid 200 decision body
+and do not apply the default all-checks threshold.
 
 Run the API and database first with `docker compose up --build`. In another
 terminal, run a single-account contention test:
@@ -275,12 +297,29 @@ docker compose run --rm \
   k6 run /scripts/consume.js
 ```
 
+Three further workload examples:
+
+```sh
+# Rejection-heavy: 5000-unit shared account allowance
+docker compose run --rm -e VUS=20 -e DURATION=30s -e ACCOUNTS=1 \
+  -e ALLOWANCE=5000 -e UNITS=1 k6 run /scripts/consume.js
+
+# Replay mix: about 20% of each VU's iterations replay its previous request ID
+docker compose run --rm -e VUS=50 -e DURATION=30s -e ACCOUNTS=10 \
+  -e DUP_RATE=0.2 k6 run /scripts/consume.js
+
+# 100 distinct users contend for one account's shared usage row
+docker compose run --rm -e VUS=100 -e DURATION=30s -e ACCOUNTS=1 \
+  k6 run /scripts/consume.js
+```
+
 Record the k6 summary's `http_reqs` rate and `http_req_duration` p90/p95 for
 each run, along with `consume_requests` rate and `consume_latency` p95/p99. Use
 the consume-only metrics for strategy comparisons. Do not compare runs with
 different VU counts, duration, account count, or Docker resources. The
-thresholds require all response checks to pass and fewer than 1% failed HTTP
-requests; latency is measured, not given a machine-independent pass threshold.
+default-mode thresholds require all response checks to pass and fewer than 1%
+failed HTTP requests. In alternate modes rejections and replays are expected;
+503 responses still appear in `consume_busy` and the failed-response count.
 
 ### Recorded locking-strategy baseline
 
@@ -360,7 +399,7 @@ The comparison is a small local sample, not a capacity guarantee. Repeat it
 with target hardware and Docker resource limits recorded before drawing a
 production conclusion.
 
-### Pool-50 concurrency scaling results
+### Historical pool-50 baseline (before the perf-branch query changes)
 
 To check whether the earlier results were constrained by the default
 PostgreSQL client pool, `DB_POOL_MAX=50` was tested against a 12-vCPU,
@@ -448,9 +487,11 @@ HAVING COALESCE(u.units_used, 0) <>
 "
 ```
 
-Each run creates fresh load-test accounts. Remove the local benchmark data only
-when you are ready to delete the whole Compose database volume:
-`docker compose down -v`.
+Each run creates fresh load-test accounts. For repeatable tests, use a
+dedicated Compose project name and remove only that project's database volume
+when resetting it, for example `docker compose -p usage-bench down -v`. Do not
+run `down -v` against the normal development project unless you intend to
+delete its database.
 
 For higher-concurrency tests, `ACCOUNTS` can exceed `VUS`; set both to 100 to
 give each virtual user its own account. The script creates one user per
@@ -495,13 +536,211 @@ The 7-statement count was verified from PostgreSQL logs before the timeout
 configuration was added; 8 is the derived current count, not a fresh log
 measurement.
 
-These are query-count results only. Throughput, p95/p99, pool-size comparisons,
-pg_stat_statements profiles, rejection-heavy and same-account/many-user
-scenarios, and Docker CPU samples have not been measured for these changes.
-Docker and k6 were unavailable in the implementation environment. Do not infer
-a throughput win from fewer SQL statements; repeat the matrix above in the
-benchmark environment and append those measurements to a separate CSV before
-making a performance claim.
+### Measured perf-branch comparison (2026-10-18)
+
+The branch was compared with `main` (`95b80d0`) using `perf` (`93ac0f4`).
+Both stacks ran on the same Windows Docker Desktop host (12 CPUs, 7.58 GiB),
+with PostgreSQL 16, `DB_POOL_MAX=50`, the same k6 script, and separate fresh
+databases. Each profile ran for 30 seconds, three times, with the order
+alternated between branches. Both used the locking consumption strategy;
+the perf branch used its default-enabled API-key cache. RPS is the k6
+consume-request rate, and p95/p99 are consume latency.
+
+| VUs / accounts | Main RPS mean (range) | Perf RPS mean (range) | Change | p95 ms mean (main / perf) | p99 ms mean (main / perf) | HTTP errors (main / perf) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 20 / 10 | 496.8 (386.0–641.1) | 637.8 (569.6–754.6) | +28.4% | 62.0 / 44.4 | 93.4 / 61.3 | 0 / 0 |
+| 50 / 10 | 569.8 (548.5–597.9) | 743.7 (676.4–789.7) | +30.5% | 107.1 / 93.0 | 133.5 / 120.2 | 0 / 57 |
+| 100 / 10 | 464.7 (428.0–508.0) | 635.6 (588.2–684.8) | +36.8% | 257.9 / 203.4 | 398.1 / 344.0 | 0 / 65 |
+| 100 / 100 | 466.4 (442.0–514.9) | 703.7 (552.4–787.4) | +50.9% | 303.5 / 186.2 | 466.9 / 261.0 | 0 / 0 |
+
+Across the four equally weighted profiles, mean throughput increased from
+499.4 to 680.2 requests/sec (+36.2%). The accepted-request rate, excluding
+errors, was approximately 499.4 versus 679.9 requests/sec (+36.1%). Perf
+outperformed main in all 12 corresponding repeats; gains varied considerably
+by profile and run, so these local results are evidence of improvement on this
+host, not a general capacity guarantee or a controlled attribution to one
+specific code change.
+
+The perf runs had 122 failed responses out of 267,936 attempts (0.046%), all
+in the 50-VU/10-account and 100-VU/10-account scenarios. PostgreSQL
+lock/statement timeouts are mapped to HTTP 503 `busy`, and the transaction
+rolls back; these attempts do not change usage. This causes the k6
+all-checks-must-pass threshold to fail for those six perf runs, while main
+had no failed responses. After each branch's run, account and user usage
+matched accepted-request history with zero mismatches. Treat the improved
+throughput together with this small but real fail-fast rate.
+
+### Timeout and pool tuning (2026-10-18)
+
+The earlier implementation used transaction-local `lock_timeout=1000ms` and
+`statement_timeout=5000ms`. During the first timeout fix, provisional defaults
+were raised to 5000/15000 ms. Both settings are applied with `SET LOCAL` after
+`pool.connect()` and `BEGIN`, so waiting for a pool connection is not charged
+against either timeout. Only PostgreSQL errors `55P03` (lock timeout) and
+`57014` (statement timeout/cancellation) map to HTTP 503 `busy`; other errors
+follow the normal error path. A timeout rolls back the transaction and the
+request-ID claim. `Retry-After` gives the corresponding configured delay;
+clients must retry with the **same request ID, user, and units**.
+
+With `statement_timeout=15000ms`, each lock-timeout setting below was run three
+times at each profile against a fresh database. Throughput is the mean and
+range; `503s` is the total across the three runs:
+
+| Lock timeout | 50 VUs / 10 accounts RPS (range) | 503s | 100 VUs / 10 accounts RPS (range) | 503s |
+|---:|---:|---:|---:|---:|
+| 1 s | 594.0 (558.6–613.6) | 58 | 626.0 (568.3–679.9) | 68 |
+| 3 s | 651.3 (627.0–672.8) | 52 | 634.2 (616.1–660.3) | 72 |
+| 5 s | 688.1 (646.6–733.3) | 57 | 637.2 (612.8–665.2) | 57 |
+| 10 s | 799.6 (716.6–841.9) | 57 | 624.9 (618.4–629.2) | 70 |
+
+No lock-timeout value produced zero 503s. A response-classified 50-VU/10-
+account run at 1/15 seconds had 18 statement-timeout responses and zero
+lock-timeout responses; its maximum consume latency was about 16.8 seconds.
+Raising `statement_timeout` to 20 seconds while keeping the lock timeout at
+1 second removed 503s in three repeats each at 50/10 and 100/10:
+
+| Profile | Repeats | RPS mean (range) | 503s |
+|---|---:|---:|---:|
+| 50 VUs / 10 accounts | 3 | 659.0 (647.4–679.0) | 0 |
+| 100 VUs / 10 accounts | 3 | 642.1 (618.9–667.8) | 0 |
+
+The more contended 100-VU/one-account case produced one statement-timeout 503
+at 20 seconds. Three perf repeats at 30 seconds produced zero 503s, so the
+selected defaults are `CONSUME_LOCK_TIMEOUT_MS=1000` and
+`CONSUME_STATEMENT_TIMEOUT_MS=30000`. This 30-second value passed the
+single-account case and the 10-account profiles; it is still a bounded
+fail-safe, not a service-level latency target.
+
+The tests ran on the same 12-vCPU, 7.58-GiB Docker Desktop host with
+PostgreSQL 16. The pool comparison used 100 VUs / 10 accounts, 30-second
+runs, 1-second lock and 20-second statement timeouts (the settings in effect
+during that matrix), and three fresh-database repeats. Pool 100 used
+PostgreSQL's default `max_connections=100`; its first audit attempt could not
+connect while all
+slots were occupied by the API. The three pool-100 runs were repeated with
+the API stopped before auditing, and all audits passed:
+
+| `DB_POOL_MAX` | RPS mean (range) | p95 ms mean | p99 ms mean | 503s | Audit mismatches |
+|---:|---:|---:|---:|---:|---:|
+| 20 | 554.2 (508.5–596.2) | 284.2 | 487.6 | 0 | 0 |
+| 50 | 647.1 (639.8–652.8) | 220.5 | 354.5 | 0 | 0 |
+| 100 | 628.7 (611.8–647.7) | 308.8 | 472.8 | 0 | 0 |
+
+Pool 50 was best in this setup. A pool of 100 both reduced throughput versus
+50 and left no spare connection for the audit/admin client. Keep the combined
+pools of all API instances below PostgreSQL's `max_connections`.
+
+The requested additional workloads ran for 30 seconds, three times each,
+alternating main and perf on every repeat. All rows below use `DB_POOL_MAX=50`,
+locking, and fresh databases. The comparison used 1-second/20-second
+lock/statement timeouts on perf; main did not have configurable timeouts. The
+final perf default was subsequently raised to a 30-second statement timeout
+after the one-account case exposed a single cancellation. RPS and latency
+percentiles are mean (range for RPS); decision counts are totals across the
+three runs:
+
+| Scenario | Main RPS (range) | Perf RPS (range) | p95 ms (main / perf) | p99 ms (main / perf) | 503s (main / perf) |
+|---|---:|---:|---:|---:|---:|
+| Rejection-heavy, 20 VUs / 1 account, allowance 5,000 | 270.4 (258.2–284.9) | 298.5 (277.0–319.9) | 276.1 / 232.4 | 488.9 / 494.0 | 0 / 0 |
+| Replay mix, 50 VUs / 10 accounts, `DUP_RATE=0.2` | 421.5 (189.8–544.6) | 443.3 (265.2–672.3) | 252.1 / 242.8 | 429.3 / 387.2 | 0 / 0 |
+| 100 VUs / 1 account | 124.0 (69.2–225.6) | 231.8 (97.1–309.4) | 2923 / 1451 | 5061 / 2933 | 0 / 1 |
+
+The corresponding accepted / rejected / replayed totals were:
+
+| Scenario | Main | Perf |
+|---|---|---|
+| Rejection-heavy | 15,000 / 9,334 / 0 | 15,000 / 11,867 / 0 |
+| Replay mix | 30,378 / 0 / 7,561 | 31,930 / 0 / 7,971 |
+| 100 VUs / 1 account at 20-second statement timeout | 11,164 / 0 / 0 | 20,862 / 0 / 0 |
+
+The perf single-account 503 was the one `57014` statement timeout noted above.
+After choosing 30 seconds, the perf 100-VU/one-account profile was repeated
+three more times: mean 265.7 requests/sec (208.6–301.1), p95 979.8 ms, p99
+1966.5 ms, 23,909 accepted units, 0 rejected/replayed requests, 0 accounting
+mismatches, and 0 busy responses. These results remove the timeout seen at
+20 seconds but are not a paired main-versus-perf retest.
+
+The rejection-heavy run accepted exactly 5,000 units in each run, with all
+further requests rejected and no accounting mismatch. Replay runs recorded
+replays separately from fresh accepted decisions. Across all completed audits,
+usage matched accepted history and there were no duplicate request IDs or
+PostgreSQL `40P01` deadlocks. One Docker CPU snapshot during contention showed
+the API at roughly 109–113% of one core; this is not a sustained CPU profile.
+Replay throughput varied widely between repeats, so the small mean differences
+are not strong evidence of a general speedup. The benchmark measures the
+bundle of query, timeout, and cache changes together, not any one change.
+The cache benefit is likely flattered by only 10 accounts and a warm
+30-second cache; a much larger or churning account population remains
+unmeasured.
+
+Raw per-run data is in
+[`timeout-lock-matrix.csv`](./loadtest/results/timeout-lock-matrix.csv),
+[`timeout-statement-matrix.csv`](./loadtest/results/timeout-statement-matrix.csv),
+[`pool-tuning.csv`](./loadtest/results/pool-tuning.csv), and
+[`scenario-results.csv`](./loadtest/results/scenario-results.csv), with the
+30-second one-account retest in
+[`one-account-30s.csv`](./loadtest/results/one-account-30s.csv). The earlier
+pool-100 audit connection failures are recorded in
+[`pool-tuning-audit-slot.csv`](./loadtest/results/pool-tuning-audit-slot.csv).
+The earlier main/perf and locking/conditional CSVs linked below preserve their
+own original run data. No sustained 100-VU soak, production-sized account
+population, PostgreSQL query profiler, or Node CPU profile was measured.
+
+To reproduce a single matrix cell safely, use the same 30-second k6 command
+shown above, set `DB_POOL_MAX`, `CONSUME_LOCK_TIMEOUT_MS`, and
+`CONSUME_STATEMENT_TIMEOUT_MS` before starting the API, then repeat it three
+times. Reset only the isolated benchmark project between repeats:
+
+```sh
+export API_PORT=3301 DB_POOL_MAX=50
+export CONSUME_LOCK_TIMEOUT_MS=1000 CONSUME_STATEMENT_TIMEOUT_MS=30000
+docker compose -p perf-bench down -v
+docker compose -p perf-bench up -d --build api
+docker cp loadtest/audit.sql perf-bench-db-1:/tmp/audit.sql
+docker compose -p perf-bench --profile loadtest run --rm \
+  -e VUS=100 -e DURATION=30s -e ACCOUNTS=10 \
+  -e CONSUME_LOCK_TIMEOUT_MS=1000 \
+  -e CONSUME_STATEMENT_TIMEOUT_MS=30000 \
+  k6 run /scripts/consume.js
+docker compose -p perf-bench exec -T db \
+  psql -X -U usage_metering -d usage_metering -f /tmp/audit.sql
+docker compose -p perf-bench down -v
+```
+
+Use a different `-p` name for each branch/project, switch between the exact
+main revision (`95b80d0`) and perf, and alternate branches on each repeat. For
+the main worktree, copy the current `loadtest/consume.js` and `loadtest/audit.sql`
+from perf into the temporary benchmark worktree so both branches use identical
+instrumentation; this does not change main's service source. The audit SQL
+prints no rows on success. This setup needs Docker Compose v2 and uses the
+bundled PostgreSQL 16 and k6 0.55.0 containers; k6 does not need to be installed
+on the host.
+
+### Locking versus conditional on the perf branch
+
+The same three-repeat matrix compared the two selectable strategies on the
+perf branch:
+
+| VUs / accounts | Locking RPS mean (range) | Conditional RPS mean (range) | Conditional change | HTTP errors (locking / conditional) |
+|---:|---:|---:|---:|---:|
+| 20 / 10 | 630.7 (594.6–689.4) | 628.2 (617.2–636.7) | −0.4% | 1 / 1 |
+| 50 / 10 | 597.5 (506.9–652.1) | 595.7 (556.0–633.0) | −0.3% | 61 / 47 |
+| 100 / 10 | 614.8 (609.5–620.6) | 623.7 (587.2–666.2) | +1.5% | 74 / 60 |
+| 100 / 100 | 678.0 (650.7–702.8) | 697.4 (657.4–729.0) | +2.9% | 0 / 0 |
+
+The conditional strategy averaged about 1% more throughput overall, with
+overlapping run ranges and no consistent per-run win. Keep locking as the
+default; the measurements do not justify claiming that conditional is
+materially faster.
+
+Raw per-run results are recorded in
+[`perf-branch-vs-main.csv`](./loadtest/results/perf-branch-vs-main.csv) and
+[`perf-locking-vs-conditional.csv`](./loadtest/results/perf-locking-vs-conditional.csv).
+They include accepted counts, failed-response counts, p95/p99, and k6 exit
+status. The earlier pool-50 table above predates these query changes and is
+not the result of this branch comparison. No PostgreSQL query profiler or
+Node CPU profile was collected; Docker CPU readings were snapshots rather
+than a sustained profile.
 
 On a warm API-key cache hit, the authentication lookup SQL is also skipped.
 This cache is configurable using `API_KEY_CACHE_ENABLED`; its 30-second TTL
@@ -515,11 +754,8 @@ four serve a constraint or a query shape, so no index was dropped. Neither
 table, but this is too small to predict behavior under load. No fillfactor
 migration was applied without a before/after workload comparison.
 
-Named prepared statements, pool-size comparisons at 20/50/100, benchmark-only
-PostgreSQL tuning, and Node CPU profiling were not performed. No post-change
-throughput-results CSV was created because there are no valid post-change load
-measurements. The historical pool-50 table above is not a post-change result.
-Fewer statements and auth-cache hits are the verified reductions; throughput
-gain and the remaining bottleneck for the optimized code are unmeasured. The
-account usage row remains a structural serialization point for multiple users
-in one account.
+Named prepared statements, pool-size comparisons, benchmark-only PostgreSQL
+tuning, and Node CPU profiling were not performed. The measured branch
+comparison is end-to-end and does not isolate the speed contribution of each
+change. The account usage row remains a structural serialization point for
+multiple users in one account.

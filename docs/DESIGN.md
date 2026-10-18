@@ -1,12 +1,12 @@
 # Usage Metering and Quota Service: Design
 
-Status: the required service, Compose demo, automated tests, and reproducible performance benchmark are implemented. The locking and conditional strategies are selectable. Local benchmark results and limitations are documented in the README; they do not show a consistent performance win for the conditional strategy.
+Status: the required service, Compose demo, automated tests, and reproducible performance benchmarks are implemented. The locking and conditional strategies are selectable. Local benchmark results and limitations are documented in the README.
 
 ## 1. Overview
 
 A backend service that other applications call before doing something costly. The caller asks "can this user consume N units?", and the service checks the account's plan and the user's plan together, records the decision, and counts the usage if the request is accepted. It does the accounting and the decision, not the actual work.
 
-Stack: Node (current LTS), TypeScript, Express 5, Zod for validation, `pg` with plain SQL, PostgreSQL. Tests use the Node test runner and supertest against PostgreSQL. Load tests use k6.
+Stack: Node (current LTS), TypeScript, Express 5, Zod for validation, `pg` with plain SQL, PostgreSQL. Tests use `node:test` (via `tsx --test`) and Supertest against PostgreSQL. Load tests use k6.
 
 Out of scope, per the brief: billing, payments, refunds, multiple resource types, end-user login, role-based permissions, distributed infrastructure.
 
@@ -174,9 +174,11 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 ## 6. Consume flow
 
 1. Authenticate the key and validate the input.
-2. Open a transaction and set transaction-local `lock_timeout` to 1 second and
-   `statement_timeout` to 5 seconds. The month comes from the database clock,
-   in UTC, taken at transaction start.
+2. Acquire a pooled connection, open a transaction, then set transaction-local
+   `lock_timeout` and `statement_timeout` from `CONSUME_LOCK_TIMEOUT_MS` and
+   `CONSUME_STATEMENT_TIMEOUT_MS`. Pool-queue time is outside the transaction
+   and does not count toward either timeout. The month comes from the database
+   clock, in UTC, taken at transaction start.
 3. Claim the request: insert (account_id, request_id, user, units) with `ON CONFLICT DO NOTHING`.
 4. If the insert did nothing, the ID is already claimed. Read the stored row. Same user and units: return the stored decision with `replayed: true`. Different user or units: return 409.
 5. Call the configured strategy. The locking path locks the user usage row
@@ -189,9 +191,46 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 7. Commit.
 8. Respond.
 
-A crash or error before commit rolls back everything, including the claimed ID, so a retry starts clean. No `isProcessed` flag is needed because the whole decision is one database transaction. A flag would be needed only if processing involved external side effects.
+A crash or error before commit rolls back everything, including the claimed ID, so a retry with the same request ID starts clean. Lock-timeout (`55P03`) and statement-timeout (`57014`) failures return HTTP 503 `busy` with `Retry-After`; other errors retain the regular error path. No `isProcessed` flag is needed because the whole decision is one database transaction. A flag would be needed only if processing involved external side effects.
 
-The sequence is described above; a separate sequence diagram is omitted.
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant API
+    participant DB as PostgreSQL
+    Caller->>API: POST /v1/consume
+    API->>DB: Look up API key on cache miss
+    API->>DB: Acquire connection; BEGIN; set local timeouts
+    Note over API,DB: Pool wait happens before the transaction and timeouts
+    API->>DB: Read account, plans, and user; FOR SHARE OF account
+    API->>DB: Insert request claim with ON CONFLICT DO NOTHING
+    alt Request already exists
+        API->>DB: Read stored request and verify same user/units
+        DB-->>API: Stored decision
+        API->>DB: COMMIT
+        API-->>Caller: Decision with replayed=true
+    else New request
+        API->>DB: Lock user_usage row FOR NO KEY UPDATE
+        opt User month row is absent
+            API->>DB: INSERT user_usage ON CONFLICT DO NOTHING
+            API->>DB: Re-lock user_usage row
+        end
+        API->>DB: Lock account_usage row FOR NO KEY UPDATE
+        opt Account month row is absent
+            API->>DB: INSERT account_usage ON CONFLICT DO NOTHING
+            API->>DB: Re-lock account_usage row
+        end
+        API->>DB: Evaluate account and user limits
+        alt Accepted
+            API->>DB: CTE writes user/account totals and request decision
+        else Rejected
+            API->>DB: Write request decision only
+        end
+        API->>DB: COMMIT
+        API-->>Caller: Decision with replayed=false
+    end
+    Note over API,DB: Timeout rolls back the transaction; 503 busy includes Retry-After
+```
 
 ## 7. Rules
 
@@ -230,7 +269,7 @@ since every user in the account updates it. Plan edits and assignments lock the
 account row exclusively, while consumption holds a shared account lock, making
 each request observe a consistent committed plan.
 
-The selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. Its accepted usage updates remain separate from the request decision write; only the locking strategy uses the combined CTE. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. PostgreSQL integration tests cover concurrent account and user monthly limits, concurrent duplicate IDs, and decision parity between strategies. Historical benchmark results did not establish a consistent performance improvement; the current query-count changes have not been load-tested in this environment. See the README.
+The selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. Its accepted usage updates remain separate from the request decision write; only the locking strategy uses the combined CTE. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. PostgreSQL integration tests cover concurrent account and user monthly limits, concurrent duplicate IDs, and decision parity between strategies. The latest paired benchmark showed about 1% average throughput difference between conditional and locking, without a consistent per-run advantage. See the README for methodology, results, and limitations.
 
 For the locking strategy, the measured accepted-request transaction count is
 13 statements before the query reductions, 11 after merging the config lookup,
@@ -287,9 +326,42 @@ Rejected alternatives, one line each:
 | Advisory lock per account | Same hold time as row locking with no benefit |
 | Append-only ledger with SUM | Does not remove the race and gets slower as history grows |
 
-The pool-50 benchmark matrix and earlier baseline are recorded in the README. The matrix used 20, 50, and 100 VUs, 10 or 100 accounts, and three repeats per configuration. The accounting audit found no mismatches. Results showed throughput flattening near 500 requests/second for the tested 10-account cases as VUs increased; the conditional strategy did not consistently outperform locking. Docker CPU samples showed PostgreSQL using more CPU than the API, without saturating the 12-vCPU host. These are local measurements, not a capacity guarantee.
+The 2026-10-18 main-vs-perf comparison used three 30-second repeats of
+20/10, 50/10, 100/10, and 100/100 VUs/accounts, with `DB_POOL_MAX=50`, on a
+12-vCPU, 7.58-GiB Docker Desktop host. The perf branch averaged 680.2 consume
+requests/sec versus 499.4 on `main` (+36.2%), and was faster in all 12 paired
+repeats. The original perf settings returned 122 `503 busy` responses from
+267,936 requests (0.046%). Audits found no usage/history mismatches. The
+conditional strategy averaged only about 1% more throughput than locking,
+within run-to-run noise, so locking remains the default.
 
-The k6 script measures consume-only throughput and p95/p99 latency, apart from account/user provisioning. Reproducible commands, per-run CSV, results, and caveats are in the README.
+The timeout matrix found that changing `lock_timeout` from 1 to 10 seconds
+while keeping `statement_timeout=15s` did not remove timeouts. A classified
+50-VU/10-account run showed the busy responses were statement timeouts, not
+lock timeouts. With `lock_timeout=1s` and `statement_timeout=20s`, the 50/10
+and 100/10 profiles each passed three fresh-database repeats without a 503.
+The additional 100-VU/one-account case still had one statement timeout at
+20 seconds; three repeats at 30 seconds had none. The selected defaults are
+therefore `CONSUME_LOCK_TIMEOUT_MS=1000` and
+`CONSUME_STATEMENT_TIMEOUT_MS=30000`. Pool acquisition happens before the
+transaction-local timeout settings and is not charged against them.
+
+Pool-size testing at 100 VUs/10 accounts, with 1-second lock and 20-second
+statement timeouts, averaged 554.2 requests/sec at pool 20, 647.1 at pool 50,
+and 628.7 at pool 100. Pool 50 also had lower p95 latency than either
+alternative. PostgreSQL's default `max_connections=100` left no
+slot for an audit client while the API pool was at 100; after stopping the API,
+the audit passed with no mismatches. Keep headroom for migrations, monitoring,
+and other clients rather than setting the pool to PostgreSQL's full limit.
+
+The k6 script also exercises rejection-heavy, replay-mix, and 100-users/one-
+account traffic. All per-run audits passed and database logs had no `40P01`
+deadlocks. CPU snapshots put the API at roughly 109–113% of one core;
+there was no sustained CPU profile. The benchmark measures the bundle of
+changes, not the effect of each one. In particular, the key cache is flattered
+by the 10-account runs: its 30-second entries stay warm, unlike a large or
+frequently changing account population. See the README for full mean/range
+tables, counts, reproducible commands, raw CSVs, and remaining limitations.
 
 ## 10. Failure scenarios
 
@@ -300,8 +372,8 @@ The k6 script measures consume-only throughput and p95/p99 latency, apart from a
 | Plan edited during a request | The request uses the plan it read under its locks, and the edit applies to the next one. Never half-applied |
 | Retry after a month rollover | Replays the stored decision from the original month, no recount |
 | Same request ID, different user or units | 409, nothing changes |
-| Consume lock or statement timeout | Rolls back the transaction and returns HTTP 503 with error code `busy`; caller can retry with the same request ID. |
-| Database unavailable | Requests surface an internal server error; the health endpoint returns an error and Docker marks the API unhealthy. |
+| Consume lock or statement timeout | Configured transaction-local PostgreSQL timeout rolls back the transaction and returns HTTP 503 with error code `busy` and `Retry-After`; caller retries with the same request ID. |
+| Database unavailable | Regular requests return the generic HTTP 500 `internal_error`; `/health` passes the database error to the same handler, returns 500, and Docker marks the API unhealthy. |
 
 ## 11. Product assumptions
 
@@ -334,14 +406,23 @@ The k6 script measures consume-only throughput and p95/p99 latency, apart from a
 
 ## 13. Known limitations
 
-- A single Postgres means an account's shared usage row is a serialization point. Local benchmarks show throughput flattening under higher concurrency; results are specific to the tested machine and are not a capacity guarantee.
+- A single Postgres means an account's shared usage row is a serialization point. High contention can trigger the configured timeouts; clients must retry `503 busy` with the same request ID. Local results are specific to the tested machine and are not a capacity guarantee.
 - Direct database writes could bypass the plan ownership check.
 - Past-month `remaining` is not reported.
 - Database-unavailable errors still use the generic internal-error response; only consume lock/statement timeouts are mapped to `busy`.
+- Pool queueing is not bounded by the consume lock/statement timeouts; `pg.Pool` waits for a connection before the transaction and its local timeout settings start.
 
 ## 14. Verification coverage
 
-Automated tests cover API key validation and cache behavior, account isolation, a 20-request concurrent duplicate storm, idempotent replay and conflict, concurrent quota enforcement, ten-user consumption while plan assignments run concurrently, timeout rollback/response behavior, and decision parity between both consumption strategies. The previously recorded k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Performance results for the current query changes remain unmeasured in this environment.
+`npm run build`, `npm run typecheck`, and the PostgreSQL-backed `npm test`
+passed; the test run reported 33 passed, 0 failed, and 0 skipped. Coverage
+includes API-key validation and cache TTL/capacity/isolation, account
+isolation, a 20-request concurrent duplicate storm, idempotent replay and
+conflict, concurrent quota enforcement, first-use monthly-row races, timeout
+rollback and same-ID retry, pool-wait exclusion, and parity between both
+consumption strategies. Each load-test run was followed by the accounting and
+request-ID audit; it returned no mismatches. Database logs showed no `40P01`
+deadlocks.
 
 ## 15. Predefined plans and the demo
 
@@ -358,6 +439,6 @@ The runnable Compose client creates users on different plans, demonstrates accep
 
 ## 16. Follow-up considerations
 
-- Consider an explicit lock timeout and documented retryable response if deployment requirements call for bounded lock waits.
 - Profile database queries and transaction timings before attempting further performance changes.
+- Repeat pool and timeout tests on deployment-sized hardware, keeping combined API pools below PostgreSQL's connection capacity.
 - If a new quota rule is required, define its period, reset behavior, decision order, schema, history snapshot, and response semantics before implementing it.

@@ -1,0 +1,4 @@
+﻿"variant","scenario","repeat","vus","accounts","allowance","units","dup_rate","requests","requests_per_sec","p95_ms","p99_ms","accepted","rejected","replayed","busy","busy_lock_timeout","busy_statement_timeout","busy_unclassified","audit_violations","audit_exit","deadlocks","k6_exit"
+"perf","one-account-100vus","1","100","1","1000000000","1","0","6258","208.6","1228.971","2569.154","6258","0","0","0","0","0","0","0","0","0","0"
+"perf","one-account-100vus","2","100","1","1000000000","1","0","8619","287.3","859.092","1661.357","8619","0","0","0","0","0","0","0","0","0","0"
+"perf","one-account-100vus","3","100","1","1000000000","1","0","9032","301.067","851.487","1668.909","9032","0","0","0","0","0","0","0","0","0","0"

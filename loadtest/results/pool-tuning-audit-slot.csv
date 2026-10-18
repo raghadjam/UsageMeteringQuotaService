@@ -1,0 +1,4 @@
+﻿"pool_max","repeat","requests_per_sec","p95_ms","p99_ms","busy","audit_violations","audit_exit","deadlocks","k6_exit","audit_failure"
+"100","1","639.433","315.702","469.591","0","7","2","0","0","psql could not connect: too many clients already"
+"100","2","563.467","360.284","601.559","0","7","2","0","0","psql could not connect: too many clients already"
+"100","3","626.5","311.409","447.566","0","7","2","0","0","psql could not connect: too many clients already"
