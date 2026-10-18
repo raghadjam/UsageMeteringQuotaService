@@ -59,13 +59,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const consumeLockTimeoutMs = positiveInteger(
     env,
     "CONSUME_LOCK_TIMEOUT_MS",
-    "5000",
+    "1000",
     60_000,
   );
   const consumeStatementTimeoutMs = positiveInteger(
     env,
     "CONSUME_STATEMENT_TIMEOUT_MS",
-    "15000",
+    "30000",
     120_000,
   );
 

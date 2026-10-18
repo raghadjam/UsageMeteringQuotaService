@@ -12,8 +12,8 @@ test("locking consumption strategy is the default", () => {
   assert.equal(config.consumptionStrategy, "locking");
   assert.equal(config.databasePoolMax, 50);
   assert.equal(config.apiKeyCacheEnabled, true);
-  assert.equal(config.consumeLockTimeoutMs, 5_000);
-  assert.equal(config.consumeStatementTimeoutMs, 15_000);
+  assert.equal(config.consumeLockTimeoutMs, 1_000);
+  assert.equal(config.consumeStatementTimeoutMs, 30_000);
 });
 
 test("consume timeouts are configurable and validated", () => {
