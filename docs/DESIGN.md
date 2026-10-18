@@ -8,7 +8,7 @@ A backend service that other applications call before doing something costly. Th
 
 Stack: Node (current LTS), TypeScript, Express 5, Zod for validation, `pg` with plain SQL, PostgreSQL. Tests use `node:test` (via `tsx --test`) and Supertest against PostgreSQL. Load tests use k6.
 
-Out of scope, per the brief: billing, payments, refunds, multiple resource types, end-user login, role-based permissions, distributed infrastructure.
+Out of scope, per the brief: billing, payments, refunds, multiple resource types, daily allowances, end-user login, role-based permissions, and distributed infrastructure. Daily allowances are future work and are not implemented.
 
 ## 2. Glossary
 
@@ -95,7 +95,9 @@ Plan ownership (a custom plan must belong to the same account) is enforced in se
 
 Account API keys contain 256 random bits, are returned only at account creation, and are stored as SHA-256 hashes. Hashing is appropriate here because randomly generated keys have high entropy and cannot feasibly be recovered from their digest.
 
-An ER diagram is omitted; the tables and relationships are described above and defined by the SQL migration.
+See [the ER diagram and architecture diagram](diagrams.md#data-model) for the
+schema and system view. The diagram follows the numbered migrations in this
+repository.
 
 ## 5. API
 
@@ -173,6 +175,10 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 
 ## 6. Consume flow
 
+The current sequence, including the cache, merged read, lazy usage-row
+initialization, combined accepted write, and timeout rollback, is shown in the
+[consume sequence diagram](diagrams.md#accepted-consume-request-replay-rejection-and-timeout).
+
 1. Authenticate the key and validate the input.
 2. Acquire a pooled connection, open a transaction, then set transaction-local
    `lock_timeout` and `statement_timeout` from `CONSUME_LOCK_TIMEOUT_MS` and
@@ -192,45 +198,6 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 8. Respond.
 
 A crash or error before commit rolls back everything, including the claimed ID, so a retry with the same request ID starts clean. Lock-timeout (`55P03`) and statement-timeout (`57014`) failures return HTTP 503 `busy` with `Retry-After`; other errors retain the regular error path. No `isProcessed` flag is needed because the whole decision is one database transaction. A flag would be needed only if processing involved external side effects.
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant API
-    participant DB as PostgreSQL
-    Caller->>API: POST /v1/consume
-    API->>DB: Look up API key on cache miss
-    API->>DB: Acquire connection; BEGIN; set local timeouts
-    Note over API,DB: Pool wait happens before the transaction and timeouts
-    API->>DB: Read account, plans, and user; FOR SHARE OF account
-    API->>DB: Insert request claim with ON CONFLICT DO NOTHING
-    alt Request already exists
-        API->>DB: Read stored request and verify same user/units
-        DB-->>API: Stored decision
-        API->>DB: COMMIT
-        API-->>Caller: Decision with replayed=true
-    else New request
-        API->>DB: Lock user_usage row FOR NO KEY UPDATE
-        opt User month row is absent
-            API->>DB: INSERT user_usage ON CONFLICT DO NOTHING
-            API->>DB: Re-lock user_usage row
-        end
-        API->>DB: Lock account_usage row FOR NO KEY UPDATE
-        opt Account month row is absent
-            API->>DB: INSERT account_usage ON CONFLICT DO NOTHING
-            API->>DB: Re-lock account_usage row
-        end
-        API->>DB: Evaluate account and user limits
-        alt Accepted
-            API->>DB: CTE writes user/account totals and request decision
-        else Rejected
-            API->>DB: Write request decision only
-        end
-        API->>DB: COMMIT
-        API-->>Caller: Decision with replayed=false
-    end
-    Note over API,DB: Timeout rolls back the transaction; 503 busy includes Retry-After
-```
 
 ## 7. Rules
 
