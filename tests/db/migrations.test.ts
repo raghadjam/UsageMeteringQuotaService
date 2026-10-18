@@ -790,6 +790,47 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
   );
   assert.deepEqual(usage.rows[0], { account: "6", user: "6" });
 
+  const updatedUserPlan = await pool.query<{ id: string }>(
+    `INSERT INTO plans (
+       kind, owner_account_id, name, monthly_allowance, max_per_request
+     )
+     VALUES ('user', $1, $2, 0, 5)
+     RETURNING id`,
+    [account.rows[0].id, `Tightened plan ${randomUUID()}`],
+  );
+  const assignmentClient = await pool.connect();
+  await assignmentClient.query("BEGIN");
+  await assignmentClient.query(
+    "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+    [account.rows[0].id],
+  );
+  await assignmentClient.query(
+    "UPDATE users SET plan_id = $2 WHERE id = $1",
+    [firstUser.rows[0].id, updatedUserPlan.rows[0].id],
+  );
+  const pendingConsumption = request(app)
+    .post("/v1/consume")
+    .set("X-API-Key", key)
+    .send({
+      user_id: "quota-user",
+      units: 1,
+      request_id: "plan-change-in-flight",
+    });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await assignmentClient.query("COMMIT");
+  assignmentClient.release();
+  const planChangeDecision = await pendingConsumption;
+  assert.equal(planChangeDecision.status, 200);
+  assert.equal(planChangeDecision.body.accepted, false);
+  assert.deepEqual(planChangeDecision.body.rejected_by, {
+    level: "user",
+    rule: "monthly_allowance",
+  });
+  assert.equal(
+    planChangeDecision.body.user.monthly_allowance,
+    0,
+  );
+
   const concurrentAccountPlan = await pool.query<{ id: string }>(
     `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
      VALUES ('account', NULL, $1, 5, 5)
