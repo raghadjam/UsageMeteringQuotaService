@@ -1,4 +1,6 @@
 import {
+  ensureAccountUsageRow,
+  ensureUserUsageRow,
   incrementUsage,
   lockAccountUsage,
   lockUserUsage,
@@ -23,8 +25,23 @@ export const lockingStrategy: ConsumptionStrategy = async ({
   accountPlan,
   userPlan,
 }): Promise<ConsumptionDecision> => {
-  const userUsedBefore = await lockUserUsage(client, userId, month);
-  const accountUsedBefore = await lockAccountUsage(client, accountId, month);
+  let userUsedBefore = await lockUserUsage(client, userId, month);
+  if (userUsedBefore === undefined) {
+    await ensureUserUsageRow(client, userId, month);
+    userUsedBefore = await lockUserUsage(client, userId, month);
+  }
+  if (userUsedBefore === undefined) {
+    throw new Error("User usage row could not be initialized");
+  }
+
+  let accountUsedBefore = await lockAccountUsage(client, accountId, month);
+  if (accountUsedBefore === undefined) {
+    await ensureAccountUsageRow(client, accountId, month);
+    accountUsedBefore = await lockAccountUsage(client, accountId, month);
+  }
+  if (accountUsedBefore === undefined) {
+    throw new Error("Account usage row could not be initialized");
+  }
   const decision = evaluateConsumption(
     units,
     {

@@ -898,7 +898,7 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
     [idempotencyAccount.rows[0].id, concurrentUserPlan.rows[0].id],
   );
   const duplicateRequestResults = await Promise.all(
-    Array.from({ length: 8 }, () =>
+    Array.from({ length: 20 }, () =>
       request(app)
         .post("/v1/consume")
         .set("X-API-Key", idempotencyKey)
@@ -914,6 +914,10 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
     duplicateRequestResults.filter((result) => result.body.replayed === false).length,
     1,
   );
+  assert.equal(
+    duplicateRequestResults.filter((result) => result.body.replayed === true).length,
+    19,
+  );
   assert.ok(duplicateRequestResults.every((result) => result.body.accepted));
   const firstDecision = {
     ...duplicateRequestResults[0].body,
@@ -922,8 +926,16 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
   for (const result of duplicateRequestResults) {
     assert.deepEqual({ ...result.body, replayed: false }, firstDecision);
   }
-  const idempotentUsage = await pool.query<{ account: string; user: string }>(
-    `SELECT au.units_used::text AS account, uu.units_used::text AS user
+  const idempotentUsage = await pool.query<{
+    account: string;
+    user: string;
+    request_count: string;
+  }>(
+    `SELECT au.units_used::text AS account, uu.units_used::text AS user,
+            (SELECT count(*)::text
+             FROM requests r
+             WHERE r.account_id = au.account_id
+               AND r.request_id = 'same-concurrent-id') AS request_count
      FROM account_usage au
      JOIN users u ON u.account_id = au.account_id
      JOIN user_usage uu ON uu.user_id = u.id AND uu.month = au.month
@@ -931,7 +943,11 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
        AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
     [idempotencyAccount.rows[0].id],
   );
-  assert.deepEqual(idempotentUsage.rows[0], { account: "1", user: "1" });
+  assert.deepEqual(idempotentUsage.rows[0], {
+    account: "1",
+    user: "1",
+    request_count: "1",
+  });
 });
 
 test("conditional strategy preserves quota limits, request replays, and usage totals under concurrency", {

@@ -5,9 +5,6 @@ import {
   completeRequest,
   findRequest,
 } from "../db/queries/requests";
-import {
-  ensureUsageRows,
-} from "../db/queries/usage";
 import { isConsumptionDecision, type ConsumptionDecision } from "./rules";
 import { lockingStrategy } from "./lockingStrategy";
 import type { ConsumptionStrategy } from "./strategy";
@@ -165,7 +162,6 @@ export async function consume(
       );
     }
 
-    await ensureUsageRows(client, input.accountId, user.user_id, month);
     const decision = await strategy({
       client,
       accountId: input.accountId,

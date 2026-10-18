@@ -121,9 +121,8 @@ export async function getUserUsageSnapshot(
   return result.rows[0];
 }
 
-export async function ensureUsageRows(
+export async function ensureUserUsageRow(
   client: PoolClient,
-  accountId: string,
   userId: string,
   month: string,
 ): Promise<void> {
@@ -133,6 +132,13 @@ export async function ensureUsageRows(
      ON CONFLICT (user_id, month) DO NOTHING`,
     [userId, month],
   );
+}
+
+export async function ensureAccountUsageRow(
+  client: PoolClient,
+  accountId: string,
+  month: string,
+): Promise<void> {
   await client.query(
     `INSERT INTO account_usage (account_id, month, units_used)
      VALUES ($1, $2, 0)
@@ -145,7 +151,7 @@ export async function lockUserUsage(
   client: PoolClient,
   userId: string,
   month: string,
-): Promise<string> {
+): Promise<string | undefined> {
   const result = await client.query<{ units_used: string }>(
     `SELECT units_used::text AS units_used
      FROM user_usage
@@ -153,17 +159,14 @@ export async function lockUserUsage(
      FOR NO KEY UPDATE`,
     [userId, month],
   );
-  if (!result.rows[0]) {
-    throw new Error("User usage row was not initialized");
-  }
-  return result.rows[0].units_used;
+  return result.rows[0]?.units_used;
 }
 
 export async function lockAccountUsage(
   client: PoolClient,
   accountId: string,
   month: string,
-): Promise<string> {
+): Promise<string | undefined> {
   const result = await client.query<{ units_used: string }>(
     `SELECT units_used::text AS units_used
      FROM account_usage
@@ -171,10 +174,7 @@ export async function lockAccountUsage(
      FOR NO KEY UPDATE`,
     [accountId, month],
   );
-  if (!result.rows[0]) {
-    throw new Error("Account usage row was not initialized");
-  }
-  return result.rows[0].units_used;
+  return result.rows[0]?.units_used;
 }
 
 export async function incrementUsage(
