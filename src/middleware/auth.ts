@@ -21,7 +21,7 @@ export interface AccountIdCache {
 const ACCOUNT_ID_CACHE_TTL_MS = 30_000;
 const ACCOUNT_ID_CACHE_MAX_ENTRIES = 10_000;
 
-export function createAccountIdCache(): AccountIdCache {
+export function createAccountIdCache(now: () => number = Date.now): AccountIdCache {
   const entries = new Map<string, { accountId: string; expiresAt: number }>();
 
   return {
@@ -30,7 +30,7 @@ export function createAccountIdCache(): AccountIdCache {
       if (!entry) {
         return undefined;
       }
-      if (entry.expiresAt <= Date.now()) {
+      if (entry.expiresAt <= now()) {
         entries.delete(apiKeyHash);
         return undefined;
       }
@@ -49,7 +49,7 @@ export function createAccountIdCache(): AccountIdCache {
       }
       entries.set(apiKeyHash, {
         accountId,
-        expiresAt: Date.now() + ACCOUNT_ID_CACHE_TTL_MS,
+        expiresAt: now() + ACCOUNT_ID_CACHE_TTL_MS,
       });
     },
   };

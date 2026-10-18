@@ -6,7 +6,10 @@ import { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "../../src/app";
 import { conditionalStrategy } from "../../src/consume/conditionalStrategy";
-import { consume } from "../../src/consume/consumeService";
+import {
+  consume,
+  getConsumeTimeoutCode,
+} from "../../src/consume/consumeService";
 import { lockingStrategy } from "../../src/consume/lockingStrategy";
 import { hashApiKey } from "../../src/middleware/auth";
 import { runMigrations } from "../../src/db/migrate";
@@ -952,6 +955,74 @@ test("consume enforces both plan levels, replays idempotently, and serializes co
   });
 });
 
+test("first requests for a new month create one usage row under concurrency", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const key = randomUUID() + randomUUID();
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [`First-month race ${randomUUID()}`, hashApiKey(key), starterPlanId],
+  );
+  const externalId = `first-month-${randomUUID()}`;
+  const user = await pool.query<{ id: string }>(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [account.rows[0].id, externalId, basicPlanId],
+  );
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+
+  const results = await Promise.all(
+    ["first-month-a", "first-month-b"].map((requestId) =>
+      request(app)
+        .post("/v1/consume")
+        .set("X-API-Key", key)
+        .send({
+          user_id: externalId,
+          units: 1,
+          request_id: requestId,
+        }),
+    ),
+  );
+
+  assert.ok(results.every((result) => result.status === 200));
+  assert.ok(results.every((result) => result.body.accepted === true));
+  const state = await pool.query<{
+    account_usage_rows: string;
+    account_units: string;
+    user_usage_rows: string;
+    user_units: string;
+    request_rows: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM account_usage
+        WHERE account_id = $1 AND month = date_trunc('month', now() AT TIME ZONE 'UTC')::date)
+         AS account_usage_rows,
+       (SELECT units_used::text FROM account_usage
+        WHERE account_id = $1 AND month = date_trunc('month', now() AT TIME ZONE 'UTC')::date)
+         AS account_units,
+       (SELECT count(*)::text FROM user_usage
+        WHERE user_id = $2 AND month = date_trunc('month', now() AT TIME ZONE 'UTC')::date)
+         AS user_usage_rows,
+       (SELECT units_used::text FROM user_usage
+        WHERE user_id = $2 AND month = date_trunc('month', now() AT TIME ZONE 'UTC')::date)
+         AS user_units,
+       (SELECT count(*)::text FROM requests WHERE account_id = $1) AS request_rows`,
+    [account.rows[0].id, user.rows[0].id],
+  );
+  assert.deepEqual(state.rows[0], {
+    account_usage_rows: "1",
+    account_units: "2",
+    user_usage_rows: "1",
+    user_units: "2",
+    request_rows: "2",
+  });
+});
+
 test("conditional strategy preserves quota limits, request replays, and usage totals under concurrency", {
   skip: !connectionString,
 }, async () => {
@@ -1281,15 +1352,25 @@ test("consume reports a locked account as busy and leaves no request claim", {
      VALUES ($1, 'busy-timeout-user', $2)`,
     [account.rows[0].id, basicPlanId],
   );
+  await pool.query(
+    `INSERT INTO account_usage (account_id, month, units_used)
+     VALUES ($1, date_trunc('month', now() AT TIME ZONE 'UTC')::date, 0)`,
+    [account.rows[0].id],
+  );
   const blocker = await pool.connect();
   await blocker.query("BEGIN");
   try {
     await blocker.query(
-      "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+      "SELECT account_id FROM account_usage WHERE account_id = $1 FOR UPDATE",
       [account.rows[0].id],
     );
     const response = await request(
-      createApp({ pool, adminApiKey: "a".repeat(32) }),
+      createApp({
+        pool,
+        adminApiKey: "a".repeat(32),
+        consumeLockTimeoutMs: 100,
+        consumeStatementTimeoutMs: 2_000,
+      }),
     )
       .post("/v1/consume")
       .set("X-API-Key", key)
@@ -1304,6 +1385,7 @@ test("consume reports a locked account as busy and leaves no request claim", {
       code: "busy",
       message: "Consumption is temporarily busy; retry the request",
     });
+    assert.equal(response.headers["retry-after"], "1");
     const requestCount = await pool.query<{ count: string }>(
       `SELECT count(*)::text AS count
        FROM requests
@@ -1314,6 +1396,136 @@ test("consume reports a locked account as busy and leaves no request claim", {
   } finally {
     await blocker.query("ROLLBACK");
     blocker.release();
+  }
+
+  const retried = await request(createApp({ pool, adminApiKey: "a".repeat(32) }))
+    .post("/v1/consume")
+    .set("X-API-Key", key)
+    .send({
+      user_id: "busy-timeout-user",
+      units: 1,
+      request_id: "busy-timeout-request",
+    });
+  assert.equal(retried.status, 200);
+  assert.equal(retried.body.accepted, true);
+  assert.equal(retried.body.replayed, false);
+  const finalState = await pool.query<{ units: string; requests: string }>(
+    `SELECT au.units_used::text AS units,
+            (SELECT count(*)::text FROM requests
+             WHERE account_id = au.account_id
+               AND request_id = 'busy-timeout-request') AS requests
+     FROM account_usage au
+     WHERE au.account_id = $1
+       AND au.month = date_trunc('month', now() AT TIME ZONE 'UTC')::date`,
+    [account.rows[0].id],
+  );
+  assert.deepEqual(finalState.rows[0], { units: "1", requests: "1" });
+});
+
+test("statement timeout returns busy and provides a retry delay", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const key = randomUUID() + randomUUID();
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [`Statement timeout ${randomUUID()}`, hashApiKey(key), starterPlanId],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'statement-timeout-user', $2)`,
+    [account.rows[0].id, basicPlanId],
+  );
+  const blocker = await pool.connect();
+  await blocker.query("BEGIN");
+  try {
+    await blocker.query(
+      "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+      [account.rows[0].id],
+    );
+    const response = await request(
+      createApp({
+        pool,
+        adminApiKey: "a".repeat(32),
+        consumeLockTimeoutMs: 2_000,
+        consumeStatementTimeoutMs: 50,
+      }),
+    )
+      .post("/v1/consume")
+      .set("X-API-Key", key)
+      .send({
+        user_id: "statement-timeout-user",
+        units: 1,
+        request_id: "statement-timeout-request",
+      });
+
+    assert.equal(response.status, 503);
+    assert.equal(response.body.error.code, "busy");
+    assert.equal(response.headers["retry-after"], "1");
+    assert.equal(
+      getConsumeTimeoutCode({ code: "57014" }),
+      "57014",
+    );
+  } finally {
+    await blocker.query("ROLLBACK");
+    blocker.release();
+  }
+});
+
+test("only PostgreSQL lock and statement timeouts map to busy", () => {
+  assert.equal(getConsumeTimeoutCode({ code: "55P03" }), "55P03");
+  assert.equal(getConsumeTimeoutCode({ code: "57014" }), "57014");
+  assert.equal(getConsumeTimeoutCode({ code: "40P01" }), undefined);
+  assert.equal(getConsumeTimeoutCode({ code: "23505" }), undefined);
+  assert.equal(getConsumeTimeoutCode(new Error("connection failed")), undefined);
+  assert.equal(getConsumeTimeoutCode(null), undefined);
+});
+
+test("waiting for a pool connection is not charged against consume timeouts", {
+  skip: !connectionString,
+}, async () => {
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const options = `-c search_path=${schemaName}`;
+  const oneConnectionPool = new Pool({
+    connectionString,
+    options,
+    max: 1,
+  });
+  const key = randomUUID() + randomUUID();
+  try {
+    const account = await oneConnectionPool.query<{ id: string }>(
+      `INSERT INTO accounts (name, api_key_hash, plan_id)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [`Pool wait ${randomUUID()}`, hashApiKey(key), starterPlanId],
+    );
+    const user = await oneConnectionPool.query<{ id: string; external_id: string }>(
+      `INSERT INTO users (account_id, external_id, plan_id)
+       VALUES ($1, $2, $3)
+       RETURNING id, external_id`,
+      [account.rows[0].id, `pool-wait-${randomUUID()}`, basicPlanId],
+    );
+    const blocker = await oneConnectionPool.connect();
+    const consuming = consume(
+      oneConnectionPool,
+      {
+        accountId: account.rows[0].id,
+        userExternalId: user.rows[0].external_id,
+        units: 1,
+        requestId: "pool-wait-does-not-timeout",
+      },
+      lockingStrategy,
+      { lockTimeoutMs: 25, statementTimeoutMs: 500 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    blocker.release();
+    const result = await consuming;
+    assert.equal(result.accepted, true);
+  } finally {
+    await oneConnectionPool.end();
   }
 });
 

@@ -18,6 +18,8 @@ export interface AppDependencies {
   adminApiKey: string;
   consumptionStrategy?: ConsumptionStrategy;
   apiKeyCacheEnabled?: boolean;
+  consumeLockTimeoutMs?: number;
+  consumeStatementTimeoutMs?: number;
 }
 
 export function createApp({
@@ -25,6 +27,8 @@ export function createApp({
   adminApiKey,
   consumptionStrategy = lockingStrategy,
   apiKeyCacheEnabled = true,
+  consumeLockTimeoutMs = 5_000,
+  consumeStatementTimeoutMs = 15_000,
 }: AppDependencies): express.Express {
   const accountIdCache: AccountIdCache | null = apiKeyCacheEnabled
     ? createAccountIdCache()
@@ -35,7 +39,15 @@ export function createApp({
   app.use("/v1", createAccountsRouter(pool, adminApiKey, accountIdCache));
   app.use("/v1", createUsersRouter(pool, accountIdCache));
   app.use("/v1", createPlansRouter(pool, accountIdCache));
-  app.use("/v1", createConsumeRouter(pool, consumptionStrategy, accountIdCache));
+  app.use(
+    "/v1",
+    createConsumeRouter(
+      pool,
+      consumptionStrategy,
+      accountIdCache,
+      { lockTimeoutMs: consumeLockTimeoutMs, statementTimeoutMs: consumeStatementTimeoutMs },
+    ),
+  );
   app.use("/v1", createUsageRouter(pool, accountIdCache));
   app.use("/v1", createRequestsRouter(pool, accountIdCache));
   app.use((_req, res) => {

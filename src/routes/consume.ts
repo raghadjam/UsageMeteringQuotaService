@@ -4,7 +4,8 @@ import type { Pool } from "pg";
 import { requireAccountApiKey } from "../middleware/auth";
 import type { AccountIdCache } from "../middleware/auth";
 import { validateBody } from "../middleware/validate";
-import { consume } from "../consume/consumeService";
+import { consume, DEFAULT_CONSUME_TIMEOUTS } from "../consume/consumeService";
+import type { ConsumeTimeouts } from "../consume/consumeService";
 import type { ConsumptionStrategy } from "../consume/strategy";
 import { lockingStrategy } from "../consume/lockingStrategy";
 
@@ -18,6 +19,7 @@ export function createConsumeRouter(
   pool: Pool,
   strategy: ConsumptionStrategy = lockingStrategy,
   accountIdCache: AccountIdCache | null = null,
+  timeouts: ConsumeTimeouts = DEFAULT_CONSUME_TIMEOUTS,
 ): Router {
   const router = Router();
 
@@ -31,7 +33,7 @@ export function createConsumeRouter(
         userExternalId: req.body.user_id,
         units: req.body.units,
         requestId: req.body.request_id,
-      }, strategy);
+      }, strategy, timeouts);
       res.status(200).json(result);
     },
   );

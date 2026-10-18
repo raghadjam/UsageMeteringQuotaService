@@ -12,6 +12,37 @@ test("locking consumption strategy is the default", () => {
   assert.equal(config.consumptionStrategy, "locking");
   assert.equal(config.databasePoolMax, 50);
   assert.equal(config.apiKeyCacheEnabled, true);
+  assert.equal(config.consumeLockTimeoutMs, 5_000);
+  assert.equal(config.consumeStatementTimeoutMs, 15_000);
+});
+
+test("consume timeouts are configurable and validated", () => {
+  const config = loadConfig({
+    ...validEnvironment,
+    CONSUME_LOCK_TIMEOUT_MS: "3000",
+    CONSUME_STATEMENT_TIMEOUT_MS: "10000",
+  });
+  assert.equal(config.consumeLockTimeoutMs, 3_000);
+  assert.equal(config.consumeStatementTimeoutMs, 10_000);
+
+  for (const value of ["0", "60001", "3.5", "invalid"]) {
+    assert.throws(
+      () => loadConfig({
+        ...validEnvironment,
+        CONSUME_LOCK_TIMEOUT_MS: value,
+      }),
+      /CONSUME_LOCK_TIMEOUT_MS must be an integer between 1 and 60000/,
+    );
+  }
+  for (const value of ["0", "120001", "3.5", "invalid"]) {
+    assert.throws(
+      () => loadConfig({
+        ...validEnvironment,
+        CONSUME_STATEMENT_TIMEOUT_MS: value,
+      }),
+      /CONSUME_STATEMENT_TIMEOUT_MS must be an integer between 1 and 120000/,
+    );
+  }
 });
 
 test("API key account cache can be disabled and rejects invalid values", () => {

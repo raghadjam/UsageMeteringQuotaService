@@ -21,6 +21,8 @@ async function main(): Promise<void> {
         adminApiKey: config.adminApiKey,
         consumptionStrategy,
         apiKeyCacheEnabled: config.apiKeyCacheEnabled,
+        consumeLockTimeoutMs: config.consumeLockTimeoutMs,
+        consumeStatementTimeoutMs: config.consumeStatementTimeoutMs,
       }),
     );
     server.listen(config.port, () => {

@@ -53,6 +53,16 @@ export interface ConsumeInput {
   requestId: string;
 }
 
+export interface ConsumeTimeouts {
+  lockTimeoutMs: number;
+  statementTimeoutMs: number;
+}
+
+export const DEFAULT_CONSUME_TIMEOUTS: ConsumeTimeouts = {
+  lockTimeoutMs: 5_000,
+  statementTimeoutMs: 15_000,
+};
+
 export interface ConsumeResult extends ConsumptionDecision {
   request_id: string;
   replayed: boolean;
@@ -66,13 +76,15 @@ function asSafeNumber(value: string, name: string): number {
   return number;
 }
 
-function isConsumeTimeout(error: unknown): boolean {
-  return (
-    error !== null &&
-    typeof error === "object" &&
-    "code" in error &&
-    (error.code === "55P03" || error.code === "57014")
-  );
+export function getConsumeTimeoutCode(
+  error: unknown,
+): "55P03" | "57014" | undefined {
+  if (error === null || typeof error !== "object" || !("code" in error)) {
+    return undefined;
+  }
+  return error.code === "55P03" || error.code === "57014"
+    ? error.code
+    : undefined;
 }
 
 function serializeDecision(
@@ -87,6 +99,7 @@ export async function consume(
   pool: Pool,
   input: ConsumeInput,
   strategy: ConsumptionStrategy = lockingStrategy,
+  timeouts: ConsumeTimeouts = DEFAULT_CONSUME_TIMEOUTS,
 ): Promise<ConsumeResult> {
   const client = await pool.connect();
   let inTransaction = false;
@@ -95,8 +108,9 @@ export async function consume(
     await client.query("BEGIN");
     inTransaction = true;
     await client.query(
-      `SELECT set_config('lock_timeout', '1000ms', true),
-              set_config('statement_timeout', '5000ms', true)`,
+      `SELECT set_config('lock_timeout', $1, true),
+              set_config('statement_timeout', $2, true)`,
+      [`${timeouts.lockTimeoutMs}ms`, `${timeouts.statementTimeoutMs}ms`],
     );
 
     const userResult = await client.query<ConsumptionUser>(
@@ -235,11 +249,20 @@ export async function consume(
     if (inTransaction) {
       await client.query("ROLLBACK");
     }
-    if (isConsumeTimeout(error)) {
+    const timeoutCode = getConsumeTimeoutCode(error);
+    if (timeoutCode !== undefined) {
       throw new AppError(
         503,
         "busy",
         "Consumption is temporarily busy; retry the request",
+        Math.max(
+          1,
+          Math.ceil(
+            (timeoutCode === "55P03"
+              ? timeouts.lockTimeoutMs
+              : timeouts.statementTimeoutMs) / 1000,
+          ),
+        ),
       );
     }
     throw error;

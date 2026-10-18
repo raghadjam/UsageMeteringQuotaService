@@ -79,3 +79,52 @@ test("cached account API key authenticates without a database lookup", async () 
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, { account_id: "cached-account-id" });
 });
+
+test("account API key cache expires entries after its fixed TTL", () => {
+  let now = 1_000;
+  const cache = createAccountIdCache(() => now);
+  cache.set("key-hash", "account-id");
+  assert.equal(cache.get("key-hash"), "account-id");
+
+  now += 29_999;
+  assert.equal(cache.get("key-hash"), "account-id");
+  now += 1;
+  assert.equal(cache.get("key-hash"), undefined);
+});
+
+test("account API key cache evicts the least-recently-used entry at capacity", () => {
+  const cache = createAccountIdCache();
+  for (let index = 0; index < 10_000; index += 1) {
+    cache.set(`key-hash-${index}`, `account-${index}`);
+  }
+
+  assert.equal(cache.get("key-hash-0"), "account-0");
+  cache.set("key-hash-new", "account-new");
+  assert.equal(cache.get("key-hash-1"), undefined);
+  assert.equal(cache.get("key-hash-0"), "account-0");
+  assert.equal(cache.get("key-hash-new"), "account-new");
+});
+
+test("different cached API keys resolve only to their own account IDs", async () => {
+  const cache = createAccountIdCache();
+  const accountAKey = "account-a-key".padEnd(32, "!");
+  const accountBKey = "account-b-key".padEnd(32, "!");
+  cache.set(hashApiKey(accountAKey), "account-a");
+  cache.set(hashApiKey(accountBKey), "account-b");
+
+  const cacheApp = express();
+  cacheApp.get(
+    "/",
+    requireAccountApiKey(pool, cache),
+    (_req, res) => res.json({ account_id: res.locals.account.id }),
+  );
+  const accountA = await request(cacheApp)
+    .get("/")
+    .set("X-API-Key", accountAKey);
+  const accountB = await request(cacheApp)
+    .get("/")
+    .set("X-API-Key", accountBKey);
+
+  assert.deepEqual(accountA.body, { account_id: "account-a" });
+  assert.deepEqual(accountB.body, { account_id: "account-b" });
+});

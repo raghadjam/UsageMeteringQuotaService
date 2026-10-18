@@ -7,6 +7,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./loadtest/audit.sql:/scripts/audit.sql:ro
     healthcheck:
       test:
         - CMD-SHELL
@@ -27,6 +28,8 @@ services:
       CONSUMPTION_STRATEGY: ${CONSUMPTION_STRATEGY:-locking}
       DB_POOL_MAX: ${DB_POOL_MAX:-50}
       API_KEY_CACHE_ENABLED: ${API_KEY_CACHE_ENABLED:-true}
+      CONSUME_LOCK_TIMEOUT_MS: ${CONSUME_LOCK_TIMEOUT_MS:-5000}
+      CONSUME_STATEMENT_TIMEOUT_MS: ${CONSUME_STATEMENT_TIMEOUT_MS:-15000}
       PORT: 3000
     ports:
       - "${API_PORT:-3000}:3000"
@@ -66,6 +69,9 @@ services:
       VUS: ${VUS:-20}
       DURATION: ${DURATION:-30s}
       ACCOUNTS: ${ACCOUNTS:-1}
+      ALLOWANCE: ${ALLOWANCE:-1000000000}
+      UNITS: ${UNITS:-1}
+      DUP_RATE: ${DUP_RATE:-0}
     volumes:
       - ./loadtest:/scripts:ro
     depends_on:
