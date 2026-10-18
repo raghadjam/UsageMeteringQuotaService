@@ -240,6 +240,14 @@ These are statement-count measurements, not evidence of higher throughput.
 
 The API pool size is configurable with `DB_POOL_MAX` (default 50, allowed 1–100). Pool size alone does not remove contention on an account's shared usage row. Further query and transaction tuning should be guided by profiling.
 
+Successful account-key lookups are cached per API process as SHA-256 key hash
+to account ID for 30 seconds, with a 10,000-entry LRU cap. This avoids the auth
+lookup SQL on cache hits; consume still reads the account and current plans
+inside its transaction. `API_KEY_CACHE_ENABLED=false` disables the cache. There
+is no API-key revocation endpoint, so a key replaced or invalidated directly
+in the database can remain accepted by that process for up to 30 seconds.
+Each API replica has an independent cache.
+
 Rejected alternatives, one line each:
 
 | Option | Why rejected |

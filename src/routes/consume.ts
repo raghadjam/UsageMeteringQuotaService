@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Pool } from "pg";
 import { requireAccountApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { validateBody } from "../middleware/validate";
 import { consume } from "../consume/consumeService";
 import type { ConsumptionStrategy } from "../consume/strategy";
@@ -16,12 +17,13 @@ const consumeSchema = z.object({
 export function createConsumeRouter(
   pool: Pool,
   strategy: ConsumptionStrategy = lockingStrategy,
+  accountIdCache: AccountIdCache | null = null,
 ): Router {
   const router = Router();
 
   router.post(
     "/consume",
-    requireAccountApiKey(pool),
+    requireAccountApiKey(pool, accountIdCache),
     validateBody(consumeSchema),
     async (req, res) => {
       const result = await consume(pool, {

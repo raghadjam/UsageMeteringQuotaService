@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Pool } from "pg";
 import { AppError } from "../errors";
 import { requireAccountApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { getAccountUsage, getSingleUserUsage } from "../services/usageService";
 import { parseMonth } from "../services/requestService";
 
@@ -18,9 +19,12 @@ function getMonth(query: unknown): string | undefined {
   return parseMonth(parsed.data.month);
 }
 
-export function createUsageRouter(pool: Pool): Router {
+export function createUsageRouter(
+  pool: Pool,
+  accountIdCache: AccountIdCache | null,
+): Router {
   const router = Router();
-  const authenticate = requireAccountApiKey(pool);
+  const authenticate = requireAccountApiKey(pool, accountIdCache);
 
   router.get("/usage", authenticate, async (req, res) => {
     const usage = await getAccountUsage(

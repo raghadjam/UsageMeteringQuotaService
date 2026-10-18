@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
+import express from "express";
 import { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "../../src/app";
+import {
+  createAccountIdCache,
+  hashApiKey,
+  requireAccountApiKey,
+} from "../../src/middleware/auth";
 
 const adminApiKey = "local-test-admin-key".padEnd(32, "!");
 const pool = new Pool({
@@ -54,4 +60,22 @@ test("invalid JSON is reported as a client error", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(response.body.error.code, "invalid_json");
+});
+
+test("cached account API key authenticates without a database lookup", async () => {
+  const apiKey = "cached-account-key".padEnd(32, "!");
+  const cache = createAccountIdCache();
+  cache.set(hashApiKey(apiKey), "cached-account-id");
+  const cacheApp = express();
+  cacheApp.get(
+    "/",
+    requireAccountApiKey(pool, cache),
+    (_req, res) => res.json({ account_id: res.locals.account.id }),
+  );
+
+  const response = await request(cacheApp)
+    .get("/")
+    .set("X-API-Key", apiKey);
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { account_id: "cached-account-id" });
 });

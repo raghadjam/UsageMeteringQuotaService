@@ -69,6 +69,14 @@ the database name, username, or password, update the corresponding values in
 the API. Keep the combined pool sizes of all API instances below PostgreSQL's
 `max_connections`.
 
+`API_KEY_CACHE_ENABLED` enables the in-memory account-key lookup cache
+(default `true`; set to `false` to disable). Successful lookups are cached by
+API-key hash for 30 seconds, up to 10,000 entries per API process. Cache hits
+skip the authentication lookup query; consume still reads the current account
+and plans inside its transaction. There is no API-key revocation endpoint, so
+a key replaced or invalidated directly in PostgreSQL may remain accepted by
+an API process for up to 30 seconds. Separate replicas have separate caches.
+
 ## Run the service without Docker
 
 Set `DATABASE_URL` and an admin secret of at least 32 characters:
@@ -489,3 +497,8 @@ Docker and k6 were unavailable in the implementation environment. Do not infer
 a throughput win from fewer SQL statements; repeat the matrix above in the
 benchmark environment and append those measurements to a separate CSV before
 making a performance claim.
+
+On a warm API-key cache hit, the authentication lookup SQL is also skipped.
+This cache is configurable using `API_KEY_CACHE_ENABLED`; its 30-second TTL
+trades immediate revocation for lower database work. No key-revocation endpoint
+exists, and cache state is local to each API process.

@@ -4,6 +4,7 @@ export interface AppConfig {
   port: number;
   databasePoolMax: number;
   consumptionStrategy: "locking" | "conditional";
+  apiKeyCacheEnabled: boolean;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -41,11 +42,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error("CONSUMPTION_STRATEGY must be locking or conditional");
   }
 
+  const apiKeyCacheEnabledValue = env.API_KEY_CACHE_ENABLED ?? "true";
+  if (apiKeyCacheEnabledValue !== "true" && apiKeyCacheEnabledValue !== "false") {
+    throw new Error("API_KEY_CACHE_ENABLED must be true or false");
+  }
+
   return {
     databaseUrl,
     adminApiKey,
     port,
     databasePoolMax,
     consumptionStrategy,
+    apiKeyCacheEnabled: apiKeyCacheEnabledValue === "true",
   };
 }

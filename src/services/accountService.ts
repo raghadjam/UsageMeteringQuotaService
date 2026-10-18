@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Pool } from "pg";
 import { hashApiKey, type AuthenticatedAccount } from "../middleware/auth";
-import { insertAccount } from "../db/queries/accounts";
+import { getAccountProfile, insertAccount } from "../db/queries/accounts";
 import { AppError } from "../errors";
 
 export interface CreatedAccount extends AuthenticatedAccount {
@@ -44,4 +44,25 @@ export async function createAccount(
   } finally {
     client.release();
   }
+}
+
+export async function getAccount(
+  pool: Pool,
+  accountId: string,
+): Promise<AuthenticatedAccount> {
+  const account = await getAccountProfile(pool, accountId);
+  if (!account) {
+    throw new AppError(401, "invalid_api_key", "Missing or invalid API key");
+  }
+
+  return {
+    id: account.id,
+    name: account.name,
+    plan: {
+      id: account.plan_id,
+      name: account.plan_name,
+      monthlyAllowance: Number(account.monthly_allowance),
+      maxPerRequest: Number(account.max_per_request),
+    },
+  };
 }

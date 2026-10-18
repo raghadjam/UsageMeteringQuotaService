@@ -2,14 +2,19 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Pool } from "pg";
 import { requireAccountApiKey, requireAdminApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { validateBody } from "../middleware/validate";
-import { createAccount } from "../services/accountService";
+import { createAccount, getAccount } from "../services/accountService";
 
 const createAccountSchema = z.object({
   name: z.string().trim().min(1).max(120),
 }).strict();
 
-export function createAccountsRouter(pool: Pool, adminApiKey: string): Router {
+export function createAccountsRouter(
+  pool: Pool,
+  adminApiKey: string,
+  accountIdCache: AccountIdCache | null,
+): Router {
   const router = Router();
 
   router.post(
@@ -32,15 +37,16 @@ export function createAccountsRouter(pool: Pool, adminApiKey: string): Router {
     },
   );
 
-  router.get("/account", requireAccountApiKey(pool), async (_req, res) => {
+  router.get("/account", requireAccountApiKey(pool, accountIdCache), async (_req, res) => {
+    const account = await getAccount(pool, res.locals.account.id);
     res.json({
-      id: res.locals.account.id,
-      name: res.locals.account.name,
+      id: account.id,
+      name: account.name,
       plan: {
-        id: res.locals.account.plan.id,
-        name: res.locals.account.plan.name,
-        monthly_allowance: res.locals.account.plan.monthlyAllowance,
-        max_per_request: res.locals.account.plan.maxPerRequest,
+        id: account.plan.id,
+        name: account.plan.name,
+        monthly_allowance: account.plan.monthlyAllowance,
+        max_per_request: account.plan.maxPerRequest,
       },
     });
   });

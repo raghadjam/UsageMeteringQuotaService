@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Pool } from "pg";
 import { AppError } from "../errors";
 import { requireAccountApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { validateBody } from "../middleware/validate";
 import { createUser, getUser, getUsers } from "../services/userService";
 
@@ -72,9 +73,12 @@ function encodeCursor(cursor: { createdAt: string; id: string }): string {
   ).toString("base64url");
 }
 
-export function createUsersRouter(pool: Pool): Router {
+export function createUsersRouter(
+  pool: Pool,
+  accountIdCache: AccountIdCache | null,
+): Router {
   const router = Router();
-  const authenticate = requireAccountApiKey(pool);
+  const authenticate = requireAccountApiKey(pool, accountIdCache);
 
   router.post(
     "/users",

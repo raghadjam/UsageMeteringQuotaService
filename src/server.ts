@@ -16,7 +16,12 @@ async function main(): Promise<void> {
       ? conditionalStrategy
       : lockingStrategy;
     const server = createServer(
-      createApp({ pool, adminApiKey: config.adminApiKey, consumptionStrategy }),
+      createApp({
+        pool,
+        adminApiKey: config.adminApiKey,
+        consumptionStrategy,
+        apiKeyCacheEnabled: config.apiKeyCacheEnabled,
+      }),
     );
     server.listen(config.port, () => {
       console.log(

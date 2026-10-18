@@ -4,6 +4,7 @@ import type { Pool } from "pg";
 import type { PlanRecord } from "../db/queries/plans";
 import { AppError } from "../errors";
 import { requireAccountApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { validateBody } from "../middleware/validate";
 import {
   assignAccountPlan,
@@ -61,9 +62,12 @@ function parsePlanId(value: string | string[]): string {
   return parsed.data;
 }
 
-export function createPlansRouter(pool: Pool): Router {
+export function createPlansRouter(
+  pool: Pool,
+  accountIdCache: AccountIdCache | null,
+): Router {
   const router = Router();
-  const authenticate = requireAccountApiKey(pool);
+  const authenticate = requireAccountApiKey(pool, accountIdCache);
 
   router.get("/plans", authenticate, async (req, res) => {
     const parsed = listPlansQuerySchema.safeParse(req.query);

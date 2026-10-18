@@ -13,10 +13,52 @@ export interface AuthenticatedAccount {
   };
 }
 
+export interface AccountIdCache {
+  get(apiKeyHash: string): string | undefined;
+  set(apiKeyHash: string, accountId: string): void;
+}
+
+const ACCOUNT_ID_CACHE_TTL_MS = 30_000;
+const ACCOUNT_ID_CACHE_MAX_ENTRIES = 10_000;
+
+export function createAccountIdCache(): AccountIdCache {
+  const entries = new Map<string, { accountId: string; expiresAt: number }>();
+
+  return {
+    get(apiKeyHash) {
+      const entry = entries.get(apiKeyHash);
+      if (!entry) {
+        return undefined;
+      }
+      if (entry.expiresAt <= Date.now()) {
+        entries.delete(apiKeyHash);
+        return undefined;
+      }
+
+      entries.delete(apiKeyHash);
+      entries.set(apiKeyHash, entry);
+      return entry.accountId;
+    },
+    set(apiKeyHash, accountId) {
+      entries.delete(apiKeyHash);
+      if (entries.size >= ACCOUNT_ID_CACHE_MAX_ENTRIES) {
+        const oldestKey = entries.keys().next().value;
+        if (oldestKey !== undefined) {
+          entries.delete(oldestKey);
+        }
+      }
+      entries.set(apiKeyHash, {
+        accountId,
+        expiresAt: Date.now() + ACCOUNT_ID_CACHE_TTL_MS,
+      });
+    },
+  };
+}
+
 declare global {
   namespace Express {
     interface Locals {
-      account: AuthenticatedAccount;
+      account: Pick<AuthenticatedAccount, "id">;
     }
   }
 }
@@ -47,7 +89,10 @@ export function requireAdminApiKey(adminApiKey: string): RequestHandler {
   };
 }
 
-export function requireAccountApiKey(pool: Pool): RequestHandler {
+export function requireAccountApiKey(
+  pool: Pool,
+  cache: AccountIdCache | null = createAccountIdCache(),
+): RequestHandler {
   return async (req, res, next) => {
     const apiKey = req.get("X-API-Key");
     if (!apiKey) {
@@ -58,40 +103,27 @@ export function requireAccountApiKey(pool: Pool): RequestHandler {
     }
 
     try {
-      const result = await pool.query<{
-        id: string;
-        name: string;
-        plan_id: string;
-        plan_name: string;
-        monthly_allowance: string;
-        max_per_request: string;
-      }>(
-        `SELECT a.id, a.name, p.id AS plan_id, p.name AS plan_name,
-                p.monthly_allowance, p.max_per_request
-         FROM accounts a
-         JOIN plans p ON p.id = a.plan_id
-         WHERE a.api_key_hash = $1`,
-        [hashApiKey(apiKey)],
-      );
+      const apiKeyHash = hashApiKey(apiKey);
+      let accountId = cache?.get(apiKeyHash);
+      if (!accountId) {
+        const result = await pool.query<{ id: string }>(
+          `SELECT id
+           FROM accounts
+           WHERE api_key_hash = $1`,
+          [apiKeyHash],
+        );
 
-      const account = result.rows[0];
-      if (!account) {
-        res.status(401).json({
-          error: { code: "invalid_api_key", message: "Missing or invalid API key" },
-        });
-        return;
+        accountId = result.rows[0]?.id;
+        if (!accountId) {
+          res.status(401).json({
+            error: { code: "invalid_api_key", message: "Missing or invalid API key" },
+          });
+          return;
+        }
+        cache?.set(apiKeyHash, accountId);
       }
 
-      res.locals.account = {
-        id: account.id,
-        name: account.name,
-        plan: {
-          id: account.plan_id,
-          name: account.plan_name,
-          monthlyAllowance: Number(account.monthly_allowance),
-          maxPerRequest: Number(account.max_per_request),
-        },
-      };
+      res.locals.account = { id: accountId };
       next();
     } catch (error) {
       next(error);

@@ -11,6 +11,23 @@ test("locking consumption strategy is the default", () => {
   const config = loadConfig(validEnvironment);
   assert.equal(config.consumptionStrategy, "locking");
   assert.equal(config.databasePoolMax, 50);
+  assert.equal(config.apiKeyCacheEnabled, true);
+});
+
+test("API key account cache can be disabled and rejects invalid values", () => {
+  const config = loadConfig({
+    ...validEnvironment,
+    API_KEY_CACHE_ENABLED: "false",
+  });
+  assert.equal(config.apiKeyCacheEnabled, false);
+
+  assert.throws(
+    () => loadConfig({
+      ...validEnvironment,
+      API_KEY_CACHE_ENABLED: "yes",
+    }),
+    /API_KEY_CACHE_ENABLED must be true or false/,
+  );
 });
 
 test("conditional consumption strategy can be selected", () => {

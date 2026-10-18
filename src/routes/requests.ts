@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Pool } from "pg";
 import { AppError } from "../errors";
 import { requireAccountApiKey } from "../middleware/auth";
+import type { AccountIdCache } from "../middleware/auth";
 import { getRequestHistory, parseMonth } from "../services/requestService";
 
 const querySchema = z.object({
@@ -43,10 +44,13 @@ function encodeCursor(cursor: { createdAt: string; id: string }): string {
   ).toString("base64url");
 }
 
-export function createRequestsRouter(pool: Pool): Router {
+export function createRequestsRouter(
+  pool: Pool,
+  accountIdCache: AccountIdCache | null,
+): Router {
   const router = Router();
 
-  router.get("/requests", requireAccountApiKey(pool), async (req, res) => {
+  router.get("/requests", requireAccountApiKey(pool, accountIdCache), async (req, res) => {
     const parsed = querySchema.safeParse(req.query);
     if (!parsed.success) {
       throw new AppError(400, "invalid_query", "Request history query is invalid");
