@@ -109,7 +109,6 @@ routes; consume applies the shared rules through either the default row-locking
 strategy or the opt-in conditional strategy.
 
 ## Accepted consume request, replay, rejection, and timeout
-
 ```mermaid
 sequenceDiagram
     autonumber
@@ -122,20 +121,20 @@ sequenceDiagram
         Auth-->>API: Account ID
     else Cache miss
         Auth->>DB: Look up API-key hash
-        DB-->>Auth: Account ID; cache for 30 seconds
+        DB-->>Auth: Account ID, cached for 30 seconds
         Auth-->>API: Account ID
     end
     API->>API: Validate body
-    API->>DB: pool.connect(); BEGIN
+    API->>DB: pool.connect() then BEGIN
     API->>DB: Set transaction-local lock_timeout and statement_timeout
-    API->>DB: Read UTC month, account/user and plans; FOR SHARE OF account
+    API->>DB: Read UTC month, account/user and plans (FOR SHARE OF account)
     API->>DB: Claim (account_id, request_id)
     alt ID already claimed
         API->>DB: Read stored row and compare user and units
         alt Same input
             DB-->>API: Stored decision JSONB
             API->>DB: COMMIT
-            API-->>Caller: Original decision; replayed=true
+            API-->>Caller: Original decision, replayed=true
         else Different input
             API->>DB: ROLLBACK
             API-->>Caller: 409 request_id_conflict
@@ -143,21 +142,21 @@ sequenceDiagram
     else New claim
         API->>DB: Lock user_usage row
         opt User usage row missing
-            API->>DB: Create row with ON CONFLICT DO NOTHING; lock again
+            API->>DB: Create row with ON CONFLICT DO NOTHING, then lock again
         end
         API->>DB: Lock account_usage row
         opt Account usage row missing
-            API->>DB: Create row with ON CONFLICT DO NOTHING; lock again
+            API->>DB: Create row with ON CONFLICT DO NOTHING, then lock again
         end
         API->>API: Evaluate rules.ts in fixed order
         alt Rejected
-            API->>DB: Store rejected outcome and decision; no usage change
+            API->>DB: Store rejected outcome and decision, no usage change
             API->>DB: COMMIT
-            API-->>Caller: accepted=false; replayed=false
+            API-->>Caller: accepted=false, replayed=false
         else Accepted
             API->>DB: Combined CTE updates both totals and request outcome/decision
             API->>DB: COMMIT
-            API-->>Caller: accepted=true; replayed=false
+            API-->>Caller: accepted=true, replayed=false
         end
     end
     opt PostgreSQL error 55P03 or 57014
@@ -166,7 +165,6 @@ sequenceDiagram
         Note over Caller: Retry same request_id, user, and units
     end
 ```
-
 Authentication and body validation happen before the consume transaction.
 Pool acquisition also precedes `BEGIN`; the transaction then reads current
 plans, claims the ID, and serializes usage access in user-then-account order.
