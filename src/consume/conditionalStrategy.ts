@@ -3,7 +3,7 @@ import {
   incrementUserUsageWithinAllowance,
 } from "../db/queries/usage";
 import { lockingStrategy } from "./lockingStrategy";
-import { evaluateConsumption, type ConsumptionDecision } from "./rules";
+import { evaluateConsumption } from "./rules";
 import type { ConsumptionStrategy } from "./strategy";
 
 function asSafeNumber(value: string, name: string): number {
@@ -14,7 +14,7 @@ function asSafeNumber(value: string, name: string): number {
   return number;
 }
 
-export const conditionalStrategy: ConsumptionStrategy = async (context): Promise<ConsumptionDecision> => {
+export const conditionalStrategy: ConsumptionStrategy = async (context) => {
   const {
     client,
     accountId,
@@ -80,5 +80,5 @@ export const conditionalStrategy: ConsumptionStrategy = async (context): Promise
     0,
     decision.account.monthly_allowance - accountUsed,
   );
-  return decision;
+  return { decision, usageWrite: { kind: "already_applied" } };
 };

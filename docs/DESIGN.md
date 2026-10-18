@@ -51,7 +51,7 @@ loadtest/                k6 scripts and results
 docs/                    this file, diagrams
 ```
 
-The strategy contract: given the transaction, account, user, units and month, return `{ accepted: true }` or `{ accepted: false, level, rule }`. The shared code builds the response and writes the record, so both strategies produce identical output. The strategy is chosen by a config value.
+The strategy contract: given the transaction, account, user, units and month, return a decision and usage-write directive. The locking strategy returns final user/account totals for the shared accepted-write statement; the conditional strategy may report that it already applied usage inside its savepoint. Rejections carry no usage write. The service stores the immutable request decision, and both paths are tested for decision parity. The strategy is chosen by a config value.
 
 ## 4. Data model
 
@@ -177,11 +177,14 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 2. Open a transaction. The month comes from the database clock, in UTC, taken at transaction start.
 3. Claim the request: insert (account_id, request_id, user, units) with `ON CONFLICT DO NOTHING`.
 4. If the insert did nothing, the ID is already claimed. Read the stored row. Same user and units: return the stored decision with `replayed: true`. Different user or units: return 409.
-5. Make sure this month's usage rows exist (insert with `ON CONFLICT DO NOTHING`, units_used = 0).
-6. Call the configured consumption strategy to check the rules and update the usage rows. The
-   account and user rows are held with shared locks to synchronize with plan
-   edits and assignments; usage lock order is always user first, then account.
-7. Write the outcome and the decision JSON to the request row, commit.
+5. Call the configured strategy. The locking path locks the user usage row
+   first and creates/re-locks it only if missing, then does the same for the
+   account usage row. This keeps initialization off the steady-state path.
+6. For an accepted locking-strategy decision, one data-modifying CTE writes
+   both final usage totals and the request decision. Rejections write only the
+   request outcome. The conditional strategy keeps its savepoint-based usage
+   updates and then writes the request decision.
+7. Commit.
 8. Respond.
 
 A crash or error before commit rolls back everything, including the claimed ID, so a retry starts clean. No `isProcessed` flag is needed because the whole decision is one database transaction. A flag would be needed only if processing involved external side effects.
@@ -214,14 +217,26 @@ Remaining is `max(0, limit - used)` and never negative. A request must pass ever
 
 Same request ID arriving at the same instant: the unique constraint on (account_id, request_id) makes the second insert wait for the first transaction. After the first commits, the second sees the conflict and replays the stored decision. Units are counted once.
 
-Different requests competing for the last units: the baseline strategy locks the
+Different requests competing for the last units: the locking strategy locks the
 user usage row, then the account usage row, with `FOR NO KEY UPDATE`, reads both,
-checks the rules, and updates. Fixed lock order prevents deadlocks. The account
-row is the known hot spot, since every user in the account updates it. Plan
-edits and assignments lock the account row exclusively, while consumption holds
-a shared account lock, making each request observe a consistent committed plan.
+and checks the rules. It creates missing monthly rows lazily while retaining
+that user-then-account order. For accepted decisions, one data-modifying CTE
+writes the final user total, account total, and request outcome/decision
+together; a missing row or request makes the transaction fail and roll back.
+Fixed lock order prevents deadlocks. The account row is the known hot spot,
+since every user in the account updates it. Plan edits and assignments lock the
+account row exclusively, while consumption holds a shared account lock, making
+each request observe a consistent committed plan.
 
-The selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. PostgreSQL integration tests cover concurrent account and user monthly limits and concurrent duplicate IDs under the conditional path. The recorded benchmark did not establish a consistent performance improvement; see the README.
+The selectable conditional strategy skips the separate usage reads on accepted requests. It conditionally increments the user row, then the account row, checking each affected-row result. Both updates happen after a savepoint. If either allowance is exhausted, rollback to the savepoint undoes any partial increment, then the locking strategy obtains a consistent usage snapshot and returns the exact rejection. This retains the user-then-account lock order. Its accepted usage updates remain separate from the request decision write; only the locking strategy uses the combined CTE. `CONSUMPTION_STRATEGY=locking|conditional` selects the implementation at service startup. PostgreSQL integration tests cover concurrent account and user monthly limits, concurrent duplicate IDs, and decision parity between strategies. Historical benchmark results did not establish a consistent performance improvement; the current query-count changes have not been load-tested in this environment. See the README.
+
+For the locking strategy, the measured accepted-request transaction count is
+13 statements before the query reductions, 11 after merging the config lookup,
+9 on the warm usage-row path after lazy initialization, and 7 after combining
+the accepted writes. The warm count excludes API-key authentication, which is
+outside the transaction. A first request in a new UTC month has additional
+lock/insert/re-lock statements for the missing user and account usage rows.
+These are statement-count measurements, not evidence of higher throughput.
 
 The API pool size is configurable with `DB_POOL_MAX` (default 50, allowed 1–100). Pool size alone does not remove contention on an account's shared usage row. Further query and transaction tuning should be guided by profiling.
 

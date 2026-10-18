@@ -6,6 +6,8 @@ import { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "../../src/app";
 import { conditionalStrategy } from "../../src/consume/conditionalStrategy";
+import { consume } from "../../src/consume/consumeService";
+import { lockingStrategy } from "../../src/consume/lockingStrategy";
 import { hashApiKey } from "../../src/middleware/auth";
 import { runMigrations } from "../../src/db/migrate";
 
@@ -1131,6 +1133,7 @@ test("conditional strategy enforces per-user monthly limits under concurrent con
     adminApiKey: "a".repeat(32),
     consumptionStrategy: conditionalStrategy,
   });
+
   const results = await Promise.all(
     Array.from({ length: 10 }, (_, index) =>
       request(app)
@@ -1165,6 +1168,100 @@ test("conditional strategy enforces per-user monthly limits under concurrent con
     [account.rows[0].id],
   );
   assert.deepEqual(usage.rows[0], { account: "3", user: "3" });
+});
+
+test("locking and conditional strategies produce identical decisions", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const accountIds: string[] = [];
+  const userExternalId = "strategy-parity-user";
+
+  for (let index = 0; index < 2; index++) {
+    const accountResult = await pool.query<{ id: string }>(
+      `INSERT INTO accounts (name, api_key_hash, plan_id)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [
+        `Strategy parity ${index} ${randomUUID()}`,
+        hashApiKey(randomUUID() + randomUUID()),
+        starterPlanId,
+      ],
+    );
+    const accountId = accountResult.rows[0].id;
+    accountIds.push(accountId);
+    const userResult = await pool.query<{ id: string }>(
+      `INSERT INTO users (account_id, external_id, plan_id)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [accountId, userExternalId, basicPlanId],
+    );
+    await pool.query(
+      `INSERT INTO account_usage (account_id, month, units_used)
+       VALUES ($1, date_trunc('month', now() AT TIME ZONE 'UTC')::date, 0)`,
+      [accountId],
+    );
+    await pool.query(
+      `INSERT INTO user_usage (user_id, month, units_used)
+       VALUES ($1, date_trunc('month', now() AT TIME ZONE 'UTC')::date, 0)`,
+      [userResult.rows[0].id],
+    );
+  }
+
+  const input = {
+    userExternalId,
+    units: 3,
+    requestId: "strategy-parity-accepted",
+  };
+  const lockingAccepted = await consume(
+    pool,
+    { ...input, accountId: accountIds[0] },
+    lockingStrategy,
+  );
+  const conditionalAccepted = await consume(
+    pool,
+    { ...input, accountId: accountIds[1] },
+    conditionalStrategy,
+  );
+  assert.deepEqual(
+    {
+      accepted: lockingAccepted.accepted,
+      account: lockingAccepted.account,
+      user: lockingAccepted.user,
+    },
+    {
+      accepted: conditionalAccepted.accepted,
+      account: conditionalAccepted.account,
+      user: conditionalAccepted.user,
+    },
+  );
+
+  const rejectedInput = { ...input, units: 21, requestId: "strategy-parity-rejected" };
+  const lockingRejected = await consume(
+    pool,
+    { ...rejectedInput, accountId: accountIds[0] },
+    lockingStrategy,
+  );
+  const conditionalRejected = await consume(
+    pool,
+    { ...rejectedInput, accountId: accountIds[1] },
+    conditionalStrategy,
+  );
+  assert.deepEqual(
+    {
+      accepted: lockingRejected.accepted,
+      rejected_by: lockingRejected.rejected_by,
+      account: lockingRejected.account,
+      user: lockingRejected.user,
+    },
+    {
+      accepted: conditionalRejected.accepted,
+      rejected_by: conditionalRejected.rejected_by,
+      account: conditionalRejected.account,
+      user: conditionalRejected.user,
+    },
+  );
 });
 
 test("usage summaries and request history are filtered, paginated, and account-scoped", {

@@ -470,3 +470,22 @@ between strategy groups. To watch resource use during each run, open another
 terminal and run `docker stats`; observe API CPU, memory, and database CPU.
 Record every repeat's consume requests/sec and p95/p99. Report the mean and
 range (min–max), not only the best run.
+
+### Consume query-count optimization (perf branch)
+
+PostgreSQL statement logging measured the locking strategy's accepted
+transaction at 13 SQL statements before the query changes, 11 after combining
+the config/month lookup, 9 on the warm usage-row path after lazy initialization,
+and 7 after combining the two usage updates with the accepted request update.
+The count excludes the API-key authentication lookup, which runs before the
+transaction. First requests in a new UTC month have extra statements to create
+and re-lock the missing user and account usage rows. Rejections do not run the
+combined usage CTE and still only write their request decision.
+
+These are query-count results only. Throughput, p95/p99, pool-size comparisons,
+pg_stat_statements profiles, rejection-heavy and same-account/many-user
+scenarios, and Docker CPU samples have not been measured for these changes.
+Docker and k6 were unavailable in the implementation environment. Do not infer
+a throughput win from fewer SQL statements; repeat the matrix above in the
+benchmark environment and append those measurements to a separate CSV before
+making a performance claim.

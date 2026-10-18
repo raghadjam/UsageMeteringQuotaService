@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import { AppError } from "../errors";
 import {
   claimRequest,
+  completeAcceptedRequestWithUsage,
   completeRequest,
   findRequest,
 } from "../db/queries/requests";
@@ -162,7 +163,7 @@ export async function consume(
       );
     }
 
-    const decision = await strategy({
+    const { decision, usageWrite } = await strategy({
       client,
       accountId: input.accountId,
       userId: user.user_id,
@@ -194,13 +195,23 @@ export async function consume(
       },
     });
 
-    const completed = await completeRequest(
-      client,
-      input.accountId,
-      input.requestId,
-      decision,
-      decision.rejected_by,
-    );
+    const completed = usageWrite?.kind === "write"
+      ? await completeAcceptedRequestWithUsage(client, {
+        accountId: input.accountId,
+        userId: user.user_id,
+        month,
+        requestId: input.requestId,
+        userUnitsUsed: usageWrite.userUnitsUsed,
+        accountUnitsUsed: usageWrite.accountUnitsUsed,
+        decision,
+      })
+      : await completeRequest(
+        client,
+        input.accountId,
+        input.requestId,
+        decision,
+        decision.rejected_by,
+      );
     if (!completed) {
       throw new Error("Claimed request could not be completed");
     }

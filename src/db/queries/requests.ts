@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import type { ConsumptionDecision } from "../../consume/rules";
 
 export interface ExistingRequest {
   user_external_id: string;
@@ -121,4 +122,62 @@ export async function completeRequest(
     ],
   );
   return result.rowCount === 1;
+}
+
+export async function completeAcceptedRequestWithUsage(
+  client: PoolClient,
+  values: {
+    accountId: string;
+    userId: string;
+    month: string;
+    requestId: string;
+    userUnitsUsed: number;
+    accountUnitsUsed: number;
+    decision: ConsumptionDecision;
+  },
+): Promise<boolean> {
+  const result = await client.query<{
+    user_count: number;
+    account_count: number;
+    request_count: number;
+  }>(
+    `WITH updated_user AS (
+       UPDATE user_usage
+       SET units_used = $5
+       WHERE user_id = $2 AND month = $3
+       RETURNING 1
+     ), updated_account AS (
+       UPDATE account_usage
+       SET units_used = $6
+       WHERE account_id = $1 AND month = $3
+       RETURNING 1
+     ), updated_request AS (
+       UPDATE requests
+       SET outcome = 'accepted',
+           rejected_level = NULL,
+           rejected_rule = NULL,
+           decision = $7
+       WHERE account_id = $1 AND request_id = $4
+       RETURNING 1
+     )
+     SELECT (SELECT count(*)::int FROM updated_user) AS user_count,
+            (SELECT count(*)::int FROM updated_account) AS account_count,
+            (SELECT count(*)::int FROM updated_request) AS request_count`,
+    [
+      values.accountId,
+      values.userId,
+      values.month,
+      values.requestId,
+      values.userUnitsUsed,
+      values.accountUnitsUsed,
+      JSON.stringify(values.decision),
+    ],
+  );
+
+  const counts = result.rows[0];
+  return (
+    counts?.user_count === 1 &&
+    counts.account_count === 1 &&
+    counts.request_count === 1
+  );
 }

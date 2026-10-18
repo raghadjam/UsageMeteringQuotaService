@@ -177,36 +177,6 @@ export async function lockAccountUsage(
   return result.rows[0]?.units_used;
 }
 
-export async function incrementUsage(
-  client: PoolClient,
-  accountId: string,
-  userId: string,
-  month: string,
-  units: number,
-): Promise<UsageAmounts> {
-  const userResult = await client.query<{ units_used: string }>(
-    `UPDATE user_usage
-     SET units_used = units_used + $3
-     WHERE user_id = $1 AND month = $2
-     RETURNING units_used::text AS units_used`,
-    [userId, month, units],
-  );
-  const accountResult = await client.query<{ units_used: string }>(
-    `UPDATE account_usage
-     SET units_used = units_used + $3
-     WHERE account_id = $1 AND month = $2
-     RETURNING units_used::text AS units_used`,
-    [accountId, month, units],
-  );
-  if (!userResult.rows[0] || !accountResult.rows[0]) {
-    throw new Error("Usage rows disappeared during a consume transaction");
-  }
-  return {
-    user: userResult.rows[0].units_used,
-    account: accountResult.rows[0].units_used,
-  };
-}
-
 export async function incrementUserUsageWithinAllowance(
   client: PoolClient,
   userId: string,
