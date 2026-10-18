@@ -248,6 +248,22 @@ is no API-key revocation endpoint, so a key replaced or invalidated directly
 in the database can remain accepted by that process for up to 30 seconds.
 Each API replica has an independent cache.
 
+Request-index audit (the indexes are defined on `requests` in migration
+`001_initial_schema.sql`):
+
+| Index | Required use |
+|---|---|
+| `requests_pkey` on `id` | Enforces unique request-row identity; the history API returns `id` as part of its stable cursor. |
+| `requests_account_request_id_unique` on `(account_id, request_id)` | `claimRequest` idempotency conflict detection and `findRequest` replay/conflict lookup. |
+| `requests_account_created_idx` on `(account_id, created_at DESC, id DESC)` | `listRequestHistory` account scope, newest-first ordering, and `(created_at, id)` cursor pagination. |
+| `requests_account_user_month_idx` on `(account_id, user_id, month)` | `listRequestHistory` account/user/month filtering; observed index scans in PostgreSQL statistics. |
+
+The small local database did not exercise the account-created index in its
+planner statistics, but it directly supports the history ordering/pagination
+shape. No request index was dropped: the remaining indexes enforce a schema
+constraint or support idempotency/history queries. Therefore no new index
+migration was justified by this audit.
+
 Rejected alternatives, one line each:
 
 | Option | Why rejected |
