@@ -151,7 +151,7 @@ will be rejected at that level. See [plan changes](docs/DESIGN.md#8-plan-changes
 
 PostgreSQL migrations create the plan, account, user, usage, and request-history
 tables, enforce their core relationships, and seed the
-Starter, Pro, Basic, and Premium plans. It requires PostgreSQL 13 or newer.
+Starter, Pro, Basic, and Premium plans. Compose uses PostgreSQL 16.
 Applying migrations repeatedly is safe. Units and plan limits are bounded by
 `9007199254740991` (`Number.MAX_SAFE_INTEGER`) to keep JSON integer values exact.
 
@@ -403,6 +403,17 @@ The Compose demo is implemented as a small CLI client in `client/demo.mjs`.
 
 ## Performance test
 
+**Performance summary (local Windows Docker Desktop, 2026-10-18)**
+
+- Main-versus-perf mean throughput: 499.4 to 680.2 consume requests/sec (+36.2%).
+- At 100 VUs on one account, mean throughput was about 1.9x higher (231.8 vs 124.0 requests/sec).
+- The shared account usage row remains the bottleneck under single-account contention.
+- Current app defaults: `CONSUME_LOCK_TIMEOUT_MS=1000`, `CONSUME_STATEMENT_TIMEOUT_MS=30000`; pool 50 performed best in the tested matrix.
+- The warm accepted path fell from 13 to 8 transaction SQL statements, including the timeout-setting statement.
+- Completed audits reported zero accounting mismatches; database logs showed zero deadlocks.
+- Conditional strategy showed no reliable gain over locking; locking remains the default.
+- Caveat: the benchmark measures a bundle of changes together, on one local machine; the 30-second key cache was flattered by a small, warm account population.
+
 The k6 test provisions fresh accounts and users through the API, then sends
 concurrent consume requests. `ACCOUNTS=1` stresses the shared account
 usage row; using multiple accounts spreads virtual users across independent
@@ -464,7 +475,7 @@ default-mode thresholds require all response checks to pass and fewer than 1%
 failed HTTP requests. In alternate modes rejections and replays are expected;
 503 responses still appear in `consume_busy` and the failed-response count.
 
-### Recorded locking-strategy baseline
+### Historical locking-strategy baseline (2026-10-17)
 
 Initial local WSL/Docker runs (20 VUs, 30 seconds, 2026-10-17) used the default
 locking strategy. The first run was followed by a database accounting query
@@ -513,7 +524,7 @@ CONSUMPTION_STRATEGY=conditional docker compose up -d --build --force-recreate a
 After each run, execute the accounting validation query below and record its
 result alongside the consume-only throughput and p95/p99 latency.
 
-### Conditional-strategy comparison results
+### Historical conditional-strategy comparison results (2026-10-17)
 
 After implementing the conditional path, the same updated k6 script was run
 twice per strategy/account layout: 20 VUs, 30 seconds, against the active
@@ -542,7 +553,7 @@ The comparison is a small local sample, not a capacity guarantee. Repeat it
 with target hardware and Docker resource limits recorded before drawing a
 production conclusion.
 
-### Historical pool-50 baseline (before the perf-branch query changes)
+### Historical pool-50 baseline (2026-10-17; before the perf-branch query changes)
 
 To check whether the earlier results were constrained by the default
 PostgreSQL client pool, `DB_POOL_MAX=50` was tested against a 12-vCPU,
@@ -679,7 +690,7 @@ The 7-statement count was verified from PostgreSQL logs before the timeout
 configuration was added; 8 is the derived current count, not a fresh log
 measurement.
 
-### Measured perf-branch comparison (2026-10-18)
+### Historical main-versus-perf comparison (2026-10-18; before final timeout tuning)
 
 The branch was compared with `main` (`95b80d0`) using `perf` (`93ac0f4`).
 Both stacks ran on the same Windows Docker Desktop host (12 CPUs, 7.58 GiB),
@@ -702,7 +713,9 @@ errors, was approximately 499.4 versus 679.9 requests/sec (+36.1%). Perf
 outperformed main in all 12 corresponding repeats; gains varied considerably
 by profile and run, so these local results are evidence of improvement on this
 host, not a general capacity guarantee or a controlled attribution to one
-specific code change.
+specific code change. These original perf settings had 122 busy responses;
+they include the earlier timeout values and precede the later zero-503 retests
+below.
 
 The perf runs had 122 failed responses out of 267,936 attempts (0.046%), all
 in the 50-VU/10-account and 100-VU/10-account scenarios. PostgreSQL
@@ -713,11 +726,12 @@ had no failed responses. After each branch's run, account and user usage
 matched accepted-request history with zero mismatches. Treat the improved
 throughput together with this small but real fail-fast rate.
 
-### Timeout and pool tuning (2026-10-18)
+### Historical timeout and pool tuning (2026-10-18)
 
-The earlier implementation used transaction-local `lock_timeout=1000ms` and
-`statement_timeout=5000ms`. During the first timeout fix, provisional defaults
-were raised to 5000/15000 ms. Both settings are applied with `SET LOCAL` after
+Historical timeout settings were 1000/5000 ms initially, then provisional
+5000/15000 ms. They were tuning stages, not the current settings. **Final
+defaults: 1000 ms lock timeout, 30000 ms statement timeout.** Both settings
+are applied with `SET LOCAL` after
 `pool.connect()` and `BEGIN`, so waiting for a pool connection is not charged
 against either timeout. Only PostgreSQL errors `55P03` (lock timeout) and
 `57014` (statement timeout/cancellation) map to HTTP 503 `busy`; other errors
@@ -859,7 +873,7 @@ prints no rows on success. This setup needs Docker Compose v2 and uses the
 bundled PostgreSQL 16 and k6 0.55.0 containers; k6 does not need to be installed
 on the host.
 
-### Locking versus conditional on the perf branch
+### Historical locking versus conditional on the perf branch (2026-10-18)
 
 The same three-repeat matrix compared the two selectable strategies on the
 perf branch:
@@ -897,8 +911,9 @@ four serve a constraint or a query shape, so no index was dropped. Neither
 table, but this is too small to predict behavior under load. No fillfactor
 migration was applied without a before/after workload comparison.
 
-Named prepared statements, pool-size comparisons, benchmark-only PostgreSQL
-tuning, and Node CPU profiling were not performed. The measured branch
+Named prepared statements, benchmark-only PostgreSQL tuning, and Node CPU
+profiling were not performed. Pool-size comparisons were performed as
+described above. The measured branch
 comparison is end-to-end and does not isolate the speed contribution of each
 change. The account usage row remains a structural serialization point for
 multiple users in one account.
