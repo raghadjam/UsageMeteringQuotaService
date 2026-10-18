@@ -174,7 +174,9 @@ Custom plan creation accepts `{ "kind": "user", "name": "Writer", "monthly_allow
 ## 6. Consume flow
 
 1. Authenticate the key and validate the input.
-2. Open a transaction. The month comes from the database clock, in UTC, taken at transaction start.
+2. Open a transaction and set transaction-local `lock_timeout` to 1 second and
+   `statement_timeout` to 5 seconds. The month comes from the database clock,
+   in UTC, taken at transaction start.
 3. Claim the request: insert (account_id, request_id, user, units) with `ON CONFLICT DO NOTHING`.
 4. If the insert did nothing, the ID is already claimed. Read the stored row. Same user and units: return the stored decision with `replayed: true`. Different user or units: return 409.
 5. Call the configured strategy. The locking path locks the user usage row
@@ -233,8 +235,10 @@ The selectable conditional strategy skips the separate usage reads on accepted r
 For the locking strategy, the measured accepted-request transaction count is
 13 statements before the query reductions, 11 after merging the config lookup,
 9 on the warm usage-row path after lazy initialization, and 7 after combining
-the accepted writes. The warm count excludes API-key authentication, which is
-outside the transaction. A first request in a new UTC month has additional
+the accepted writes. The transaction-local timeout settings add one statement,
+so the current warm accepted path is 8 SQL statements. The warm count excludes
+API-key authentication, which is outside the transaction and is skipped on an
+API-key cache hit. A first request in a new UTC month has additional
 lock/insert/re-lock statements for the missing user and account usage rows.
 These are statement-count measurements, not evidence of higher throughput.
 
@@ -289,7 +293,7 @@ The k6 script measures consume-only throughput and p95/p99 latency, apart from a
 | Plan edited during a request | The request uses the plan it read under its locks, and the edit applies to the next one. Never half-applied |
 | Retry after a month rollover | Replays the stored decision from the original month, no recount |
 | Same request ID, different user or units | 409, nothing changes |
-| Lock wait too long | No application-specific lock timeout is configured; behavior follows PostgreSQL/server defaults. |
+| Consume lock or statement timeout | Rolls back the transaction and returns HTTP 503 with error code `busy`; caller can retry with the same request ID. |
 | Database unavailable | Requests surface an internal server error; the health endpoint returns an error and Docker marks the API unhealthy. |
 
 ## 11. Product assumptions
@@ -326,11 +330,11 @@ The k6 script measures consume-only throughput and p95/p99 latency, apart from a
 - A single Postgres means an account's shared usage row is a serialization point. Local benchmarks show throughput flattening under higher concurrency; results are specific to the tested machine and are not a capacity guarantee.
 - Direct database writes could bypass the plan ownership check.
 - Past-month `remaining` is not reported.
-- No application-specific lock-wait timeout or dedicated database-unavailable response has been implemented.
+- Database-unavailable errors still use the generic internal-error response; only consume lock/statement timeouts are mapped to `busy`.
 
 ## 14. Verification coverage
 
-Automated tests cover API key validation, account isolation, idempotent replay and conflict, concurrent quota enforcement, plan changes, and both consumption strategies. The k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Manual API checks can additionally verify month rollover and historical queries.
+Automated tests cover API key validation and cache behavior, account isolation, a 20-request concurrent duplicate storm, idempotent replay and conflict, concurrent quota enforcement, plan changes, timeout rollback/response behavior, and decision parity between both consumption strategies. The previously recorded k6 matrix exercises concurrent accepted requests; a database audit compares stored usage against accepted request history. Performance results for the current query changes remain unmeasured in this environment.
 
 ## 15. Predefined plans and the demo
 

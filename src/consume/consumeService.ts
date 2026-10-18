@@ -66,6 +66,15 @@ function asSafeNumber(value: string, name: string): number {
   return number;
 }
 
+function isConsumeTimeout(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error.code === "55P03" || error.code === "57014")
+  );
+}
+
 function serializeDecision(
   requestId: string,
   decision: ConsumptionDecision,
@@ -85,6 +94,10 @@ export async function consume(
   try {
     await client.query("BEGIN");
     inTransaction = true;
+    await client.query(
+      `SELECT set_config('lock_timeout', '1000ms', true),
+              set_config('statement_timeout', '5000ms', true)`,
+    );
 
     const userResult = await client.query<ConsumptionUser>(
       `SELECT date_trunc(
@@ -221,6 +234,13 @@ export async function consume(
   } catch (error) {
     if (inTransaction) {
       await client.query("ROLLBACK");
+    }
+    if (isConsumeTimeout(error)) {
+      throw new AppError(
+        503,
+        "busy",
+        "Consumption is temporarily busy; retry the request",
+      );
     }
     throw error;
   } finally {

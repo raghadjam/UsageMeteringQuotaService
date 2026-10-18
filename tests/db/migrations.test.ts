@@ -1264,6 +1264,59 @@ test("locking and conditional strategies produce identical decisions", {
   );
 });
 
+test("consume reports a locked account as busy and leaves no request claim", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { starterPlanId, basicPlanId } = requireSeed();
+  const key = randomUUID() + randomUUID();
+  const account = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [`Busy timeout account ${randomUUID()}`, hashApiKey(key), starterPlanId],
+  );
+  await pool.query(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'busy-timeout-user', $2)`,
+    [account.rows[0].id, basicPlanId],
+  );
+  const blocker = await pool.connect();
+  await blocker.query("BEGIN");
+  try {
+    await blocker.query(
+      "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+      [account.rows[0].id],
+    );
+    const response = await request(
+      createApp({ pool, adminApiKey: "a".repeat(32) }),
+    )
+      .post("/v1/consume")
+      .set("X-API-Key", key)
+      .send({
+        user_id: "busy-timeout-user",
+        units: 1,
+        request_id: "busy-timeout-request",
+      });
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(response.body.error, {
+      code: "busy",
+      message: "Consumption is temporarily busy; retry the request",
+    });
+    const requestCount = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM requests
+       WHERE account_id = $1 AND request_id = 'busy-timeout-request'`,
+      [account.rows[0].id],
+    );
+    assert.equal(requestCount.rows[0].count, "0");
+  } finally {
+    await blocker.query("ROLLBACK");
+    blocker.release();
+  }
+});
+
 test("usage summaries and request history are filtered, paginated, and account-scoped", {
   skip: !connectionString,
 }, async () => {

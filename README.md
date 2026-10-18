@@ -485,10 +485,12 @@ PostgreSQL statement logging measured the locking strategy's accepted
 transaction at 13 SQL statements before the query changes, 11 after combining
 the config/month lookup, 9 on the warm usage-row path after lazy initialization,
 and 7 after combining the two usage updates with the accepted request update.
-The count excludes the API-key authentication lookup, which runs before the
-transaction. First requests in a new UTC month have extra statements to create
-and re-lock the missing user and account usage rows. Rejections do not run the
-combined usage CTE and still only write their request decision.
+Transaction-local lock and statement timeouts add one statement, so the current
+warm accepted path uses 8 SQL statements. The count excludes the API-key
+authentication lookup, which runs before the transaction and is skipped on a
+warm API-key cache hit. First requests in a new UTC month have extra statements
+to create and re-lock the missing user and account usage rows. Rejections do
+not run the combined usage CTE and still only write their request decision.
 
 These are query-count results only. Throughput, p95/p99, pool-size comparisons,
 pg_stat_statements profiles, rejection-heavy and same-account/many-user
