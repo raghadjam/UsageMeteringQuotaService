@@ -4,6 +4,149 @@ Backend service for recording usage and enforcing account-level and user-level
 quotas. Accounts, users, custom plans, plan assignments, and transactional
 consumption with idempotent request history are implemented.
 
+An account owns registered users and has an account plan; each user also has a
+user plan. A consume request must fit both plans' per-request and monthly
+limits. Accepted usage is recorded once in PostgreSQL, and the saved decision
+can be replayed safely with the caller's request ID.
+
+## Quick start
+
+Copy `.env.example` to `.env`, then run `docker compose up --build`. Compose
+starts PostgreSQL 16 and the API, waits for health checks, and runs the
+dependency-free Node demo client. The client creates a demo account and
+demonstrates accepted and rejected requests and plan changes. The API is at
+`http://localhost:3000/v1`; check `http://localhost:3000/v1/health` for
+readiness. Never commit `.env` or real credentials.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Diagrams](#diagrams)
+- [Predefined plans and rules](#predefined-plans-and-rules)
+- [Testing](#testing)
+- [Database and tests](#database-and-tests)
+- [Run the full stack with Docker Compose](#run-the-full-stack-with-docker-compose)
+- [Accounts and API keys](#accounts-and-api-keys)
+- [Users](#users)
+- [Plans and assignments](#plans-and-assignments)
+- [Consume units](#consume-units)
+- [Usage and request history](#usage-and-request-history)
+- [Performance test](#performance-test)
+- [Design details](docs/DESIGN.md)
+
+## Diagrams
+
+The architecture at a glance:
+
+```mermaid
+flowchart LR
+    subgraph Compose[Docker Compose]
+        Demo[demo-client: client/demo.mjs]
+        API[Express API]
+        DB[(PostgreSQL 16)]
+        K6[k6 load test profile]
+        Demo -->|HTTP walkthrough| API
+        K6 -->|HTTP traffic| API
+        API -->|SQL / migrations| DB
+        K6 -.->|audit SQL| DB
+    end
+    Admin[Admin caller] -->|POST /v1/accounts| API
+    Client[Account client] -->|API key| Auth[Auth and 30s key cache]
+    Auth --> Validate[Validation]
+    Validate --> Routes[Routes]
+    Routes --> Services[Services]
+    Routes --> Consume[Consume service]
+    Routes -. errors .-> ErrorHandler[Central error handler]
+    Consume -. errors .-> ErrorHandler
+    Consume --> Rules[rules.ts]
+    Consume --> Strategy{Strategy}
+    Strategy -->|default| Lock[Locking]
+    Strategy -->|optional| Conditional[Conditional]
+    Lock --> DB
+    Conditional --> DB
+```
+
+See [the schema, consume sequence, rules, and idempotency diagrams](docs/diagrams.md).
+
+## Predefined plans and rules
+
+| Plan | Kind | Monthly allowance | Max per request |
+|---|---|---:|---:|
+| Starter | account | 1,000 | 100 |
+| Pro | account | 100,000 | 1,000 |
+| Basic | user | 100 | 20 |
+| Premium | user | 1,000 | 100 |
+
+Each request must pass the per-request limit and monthly allowance at both the
+user and account levels. Rejections follow this fixed order: user per-request,
+account per-request, user monthly, account monthly. Remaining is
+`max(0, limit - used)`; accepted usage increments both levels, while rejected
+usage changes neither.
+
+## Testing
+
+Use Node 22 or newer for local development. Run `npm test` with PostgreSQL
+available and `TEST_DATABASE_URL` set for the database integration tests. For
+example, start PostgreSQL 16 in Docker with a host port:
+
+```powershell
+docker run --rm -d --name usage-metering-test-db `
+  -e POSTGRES_USER=usage_metering `
+  -e POSTGRES_PASSWORD=test_password `
+  -e POSTGRES_DB=usage_metering `
+  -p 5432:5432 postgres:16-alpine
+$env:TEST_DATABASE_URL = "postgres://usage_metering:test_password@localhost:5432/usage_metering"
+npm test
+```
+
+The latest recorded full run reports **33 passed, 0 failed, 0 skipped**. The
+Compose k6 profile can be run after starting the stack, with workload
+variables such as `VUS`, `DURATION`, and `ACCOUNTS` as needed:
+
+```sh
+docker compose --profile loadtest run --rm k6 run /scripts/consume.js
+```
+
+For the accounting audit after a load test, run:
+
+```sh
+docker compose exec -T db psql -U usage_metering -d usage_metering -f /scripts/audit.sql
+```
+
+## Design details
+
+### Product assumptions
+
+The service meters one resource in whole-number units against the UTC calendar
+month. A quota rejection is a final decision returned as HTTP 200; see the
+[product assumptions](docs/DESIGN.md#11-product-assumptions).
+
+### Design decisions and tradeoffs
+
+PostgreSQL transactions make the usage changes and request decision atomic.
+The shared account usage row serializes requests for users in that account;
+the [design notes](docs/DESIGN.md#12-design-decisions-and-tradeoffs) explain
+why this is favored over approximate counters and other alternatives.
+
+### Known limitations
+
+This is a single-PostgreSQL service. Pool wait is outside the consume timeout,
+and API-key cache entries can delay direct database key revocation by up to 30
+seconds. See [known limitations](docs/DESIGN.md#13-known-limitations).
+
+### Retry behavior
+
+`request_id` is idempotent per account. Same ID, user, and units replay the
+saved decision; changed input returns 409. On 503 `busy`, retry the same ID,
+user, and units because the transaction and claim were rolled back. See
+[failure scenarios](docs/DESIGN.md#10-failure-scenarios).
+
+### Plan changes
+
+Edits and switches apply to the next request and preserve accumulated usage.
+If the allowance falls below usage, remaining is zero and further requests
+will be rejected at that level. See [plan changes](docs/DESIGN.md#8-plan-changes).
+
 ## Database and tests
 
 PostgreSQL migrations create the plan, account, user, usage, and request-history
