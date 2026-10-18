@@ -504,3 +504,19 @@ On a warm API-key cache hit, the authentication lookup SQL is also skipped.
 This cache is configurable using `API_KEY_CACHE_ENABLED`; its 30-second TTL
 trades immediate revocation for lower database work. No key-revocation endpoint
 exists, and cache state is local to each API process.
+
+The request indexes were audited against idempotency and history queries; all
+four serve a constraint or a query shape, so no index was dropped. Neither
+`user_usage.units_used` nor `account_usage.units_used` is indexed. The local
+`pg_stat_user_tables` sample showed 9 updates and 9 HOT updates for each usage
+table, but this is too small to predict behavior under load. No fillfactor
+migration was applied without a before/after workload comparison.
+
+Named prepared statements, pool-size comparisons at 20/50/100, benchmark-only
+PostgreSQL tuning, and Node CPU profiling were not performed. No post-change
+throughput-results CSV was created because there are no valid post-change load
+measurements. The historical pool-50 table above is not a post-change result.
+Fewer statements and auth-cache hits are the verified reductions; throughput
+gain and the remaining bottleneck for the optimized code are unmeasured. The
+account usage row remains a structural serialization point for multiple users
+in one account.

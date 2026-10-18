@@ -268,6 +268,10 @@ shape. No request index was dropped: the remaining indexes enforce a schema
 constraint or support idempotency/history queries. Therefore no new index
 migration was justified by this audit.
 
+Neither usage table indexes `units_used`; the local statistics sample showed
+9 updates and 9 HOT updates for each table. This sample is too small to assess
+the effect of a different fillfactor, so no fillfactor migration was added.
+
 Rejected alternatives, one line each:
 
 | Option | Why rejected |
