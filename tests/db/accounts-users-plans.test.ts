@@ -1,0 +1,464 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { test } from "node:test";
+import request from "supertest";
+import { createApp } from "../../src/app";
+import { hashApiKey } from "../../src/middleware/auth";
+import { connectionString, registerDbHooks, requireSeed, requireTestPool } from "./helpers";
+
+registerDbHooks();
+
+test("account keys authenticate only as their own account", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { accountId, starterPlanId } = requireSeed();
+  const otherKey = randomUUID() + randomUUID();
+  const otherAccount = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Other account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(otherKey), starterPlanId],
+  );
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+
+  const accountResponse = await request(app)
+    .get("/v1/account")
+    .set("X-API-Key", "a".repeat(32));
+  assert.equal(accountResponse.status, 401);
+
+  const firstApiKey = "a".repeat(32);
+  await pool.query(
+    "UPDATE accounts SET api_key_hash = $1 WHERE id = $2",
+    [hashApiKey(firstApiKey), accountId],
+  );
+
+  const authenticated = await request(app)
+    .get("/v1/account")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(authenticated.status, 200);
+  assert.equal(authenticated.body.id, accountId);
+
+  const otherAuthenticated = await request(app)
+    .get("/v1/account")
+    .set("X-API-Key", otherKey);
+  assert.equal(otherAuthenticated.status, 200);
+  assert.equal(otherAuthenticated.body.id, otherAccount.rows[0].id);
+
+  const missingKey = await request(app).get("/v1/account");
+  assert.equal(missingKey.status, 401);
+  const invalidKey = await request(app)
+    .get("/v1/account")
+    .set("X-API-Key", "invalid-key");
+  assert.equal(invalidKey.status, 401);
+  assert.deepEqual(missingKey.body, invalidKey.body);
+});
+
+test("admin can create accounts and receives a one-time API key", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const app = createApp({ pool, adminApiKey: "admin-secret-key".padEnd(32, "!") });
+  const payload = { name: "Created through API" };
+
+  const unauthorized = await request(app).post("/v1/accounts").send(payload);
+  assert.equal(unauthorized.status, 401);
+
+  const invalid = await request(app)
+    .post("/v1/accounts")
+    .set("X-Admin-API-Key", "admin-secret-key".padEnd(32, "!"))
+    .send({ name: " " });
+  assert.equal(invalid.status, 400);
+
+  const created = await request(app)
+    .post("/v1/accounts")
+    .set("X-Admin-API-Key", "admin-secret-key".padEnd(32, "!"))
+    .send(payload);
+  assert.equal(created.status, 201);
+  assert.equal(created.body.name, payload.name);
+  assert.equal(created.body.plan.name, "Starter");
+  assert.equal(typeof created.body.api_key, "string");
+  assert.ok(created.body.api_key.length >= 40);
+
+  const saved = await pool.query<{ api_key_hash: string }>(
+    "SELECT api_key_hash FROM accounts WHERE id = $1",
+    [created.body.id],
+  );
+  assert.equal(saved.rows[0].api_key_hash, hashApiKey(created.body.api_key));
+  assert.notEqual(saved.rows[0].api_key_hash, created.body.api_key);
+
+  const authenticated = await request(app)
+    .get("/v1/account")
+    .set("X-API-Key", created.body.api_key);
+  assert.equal(authenticated.status, 200);
+  assert.equal(authenticated.body.id, created.body.id);
+});
+
+test("users are created, listed, and fetched only within their authenticated account", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { accountId, starterPlanId, basicPlanId } = requireSeed();
+  const firstApiKey = randomUUID() + randomUUID();
+  const secondApiKey = randomUUID() + randomUUID();
+
+  await pool.query(
+    "UPDATE accounts SET api_key_hash = $1 WHERE id = $2",
+    [hashApiKey(firstApiKey), accountId],
+  );
+  const secondAccountResult = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Second user-test account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(secondApiKey), starterPlanId],
+  );
+  const secondAccountId = secondAccountResult.rows[0].id;
+  const customPlanResult = await pool.query<{ id: string }>(
+    `INSERT INTO plans (kind, owner_account_id, name, monthly_allowance, max_per_request)
+     VALUES ('user', $1, 'User-test custom plan', 250, 30)
+     RETURNING id`,
+    [accountId],
+  );
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+
+  const created = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "demo-user" });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.user.external_id, "demo-user");
+  assert.equal(created.body.user.plan.id, basicPlanId);
+  assert.equal(created.body.user.plan.name, "Basic");
+
+  const duplicate = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "demo-user" });
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicate.body.error.code, "user_already_exists");
+
+  const assignedCustomPlan = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "custom-plan-user", plan_id: customPlanResult.rows[0].id });
+  assert.equal(assignedCustomPlan.status, 201);
+  assert.equal(assignedCustomPlan.body.user.plan.name, "User-test custom plan");
+
+  const wrongPlanKind = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", firstApiKey)
+    .send({ external_id: "wrong-plan-kind", plan_id: starterPlanId });
+  assert.equal(wrongPlanKind.status, 404);
+
+  const crossAccountCustomPlan = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", secondApiKey)
+    .send({
+      external_id: "cross-account-plan",
+      plan_id: customPlanResult.rows[0].id,
+    });
+  assert.equal(crossAccountCustomPlan.status, 404);
+
+  const otherAccountUser = await request(app)
+    .post("/v1/users")
+    .set("X-API-Key", secondApiKey)
+    .send({ external_id: "private-user" });
+  assert.equal(otherAccountUser.status, 201);
+
+  const isolatedLookup = await request(app)
+    .get("/v1/users/demo-user")
+    .set("X-API-Key", secondApiKey);
+  assert.equal(isolatedLookup.status, 404);
+  const isolatedList = await request(app)
+    .get("/v1/users")
+    .set("X-API-Key", secondApiKey);
+  assert.equal(isolatedList.status, 200);
+  assert.deepEqual(
+    isolatedList.body.users.map((user: { external_id: string }) => user.external_id),
+    ["private-user"],
+  );
+
+  const lookup = await request(app)
+    .get("/v1/users/demo-user")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(lookup.status, 200);
+  assert.equal(lookup.body.user.id, created.body.user.id);
+
+  for (const externalId of ["page-user-a", "page-user-b", "page-user-c"]) {
+    const response = await request(app)
+      .post("/v1/users")
+      .set("X-API-Key", firstApiKey)
+      .send({ external_id: externalId });
+    assert.equal(response.status, 201);
+  }
+
+  const firstPage = await request(app)
+    .get("/v1/users?limit=2")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(firstPage.status, 200);
+  assert.equal(firstPage.body.users.length, 2);
+  assert.equal(typeof firstPage.body.next_cursor, "string");
+
+  const secondPage = await request(app)
+    .get("/v1/users")
+    .query({ limit: 2, cursor: firstPage.body.next_cursor })
+    .set("X-API-Key", firstApiKey);
+  assert.equal(secondPage.status, 200);
+  assert.equal(secondPage.body.users.length, 2);
+  assert.notEqual(firstPage.body.users[1].id, secondPage.body.users[0].id);
+
+  const thirdPage = await request(app)
+    .get("/v1/users")
+    .query({ limit: 2, cursor: secondPage.body.next_cursor })
+    .set("X-API-Key", firstApiKey);
+  assert.equal(thirdPage.status, 200);
+  assert.equal(thirdPage.body.users.length, 2);
+  assert.equal(thirdPage.body.next_cursor, null);
+  const pagedIds = [
+    ...firstPage.body.users,
+    ...secondPage.body.users,
+    ...thirdPage.body.users,
+  ].map((user: { id: string }) => user.id);
+  assert.equal(new Set(pagedIds).size, pagedIds.length);
+
+  const invalidCursor = await request(app)
+    .get("/v1/users?cursor=invalid")
+    .set("X-API-Key", firstApiKey);
+  assert.equal(invalidCursor.status, 400);
+  assert.equal(invalidCursor.body.error.code, "invalid_cursor");
+
+  const otherAccountUserCount = await pool.query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM users WHERE account_id = $1",
+    [secondAccountId],
+  );
+  assert.equal(otherAccountUserCount.rows[0].count, "1");
+});
+
+test("plans are account-scoped, predefined plans are read-only, and assignments update current limits", {
+  skip: !connectionString,
+}, async () => {
+  const pool = requireTestPool();
+  const { accountId, starterPlanId, basicPlanId } = requireSeed();
+  const ownerKey = randomUUID() + randomUUID();
+  const otherKey = randomUUID() + randomUUID();
+
+  await pool.query(
+    "UPDATE accounts SET api_key_hash = $1 WHERE id = $2",
+    [hashApiKey(ownerKey), accountId],
+  );
+  const otherAccountResult = await pool.query<{ id: string }>(
+    `INSERT INTO accounts (name, api_key_hash, plan_id)
+     VALUES ('Plan-test other account', $1, $2)
+     RETURNING id`,
+    [hashApiKey(otherKey), starterPlanId],
+  );
+  const otherAccountId = otherAccountResult.rows[0].id;
+  const otherUserResult = await pool.query<{ id: string }>(
+    `INSERT INTO users (account_id, external_id, plan_id)
+     VALUES ($1, 'plan-test-user', $2)
+     RETURNING id`,
+    [otherAccountId, basicPlanId],
+  );
+  const customUserPlanName = `Writer ${randomUUID().slice(0, 8)}`;
+  const app = createApp({ pool, adminApiKey: "a".repeat(32) });
+  const ownerHeaders = { "X-API-Key": ownerKey };
+  const otherHeaders = { "X-API-Key": otherKey };
+
+  const list = await request(app).get("/v1/plans").set(ownerHeaders);
+  assert.equal(list.status, 200);
+  assert.deepEqual(
+    list.body.plans.map((plan: { name: string }) => plan.name).sort(),
+    ["Basic", "Premium", "Pro", "Starter", "User-test custom plan"],
+  );
+  const userPlanList = await request(app)
+    .get("/v1/plans?kind=user")
+    .set(ownerHeaders);
+  assert.equal(userPlanList.status, 200);
+  assert.ok(userPlanList.body.plans.every((plan: { kind: string }) => plan.kind === "user"));
+  const predefinedPlan = await request(app)
+    .get(`/v1/plans/${basicPlanId}`)
+    .set(ownerHeaders);
+  assert.equal(predefinedPlan.status, 200);
+  assert.equal(predefinedPlan.body.plan.is_predefined, true);
+
+  const invalidPlan = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: "unsafe",
+      monthly_allowance: 9007199254740992,
+      max_per_request: 1,
+    });
+  assert.equal(invalidPlan.status, 400);
+
+  const accountPlanResponse = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "account",
+      name: "Team Plus",
+      monthly_allowance: 5000,
+      max_per_request: 250,
+    });
+  assert.equal(accountPlanResponse.status, 201);
+  const accountPlan = accountPlanResponse.body.plan;
+  assert.equal(accountPlan.is_predefined, false);
+
+  const userPlanResponse = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: customUserPlanName,
+      monthly_allowance: 300,
+      max_per_request: 40,
+    });
+  assert.equal(userPlanResponse.status, 201);
+  const userPlan = userPlanResponse.body.plan;
+
+  const duplicateName = await request(app)
+    .post("/v1/plans")
+    .set(ownerHeaders)
+    .send({
+      kind: "user",
+      name: customUserPlanName,
+      monthly_allowance: 400,
+      max_per_request: 50,
+    });
+  assert.equal(duplicateName.status, 409);
+
+  const visibleCustomPlan = await request(app)
+    .get(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders);
+  assert.equal(visibleCustomPlan.status, 200);
+  const hiddenPlan = await request(app)
+    .get(`/v1/plans/${userPlan.id}`)
+    .set(otherHeaders);
+  assert.equal(hiddenPlan.status, 404);
+
+  const otherPlanList = await request(app).get("/v1/plans").set(otherHeaders);
+  assert.equal(otherPlanList.status, 200);
+  assert.equal(otherPlanList.body.plans.length, 4);
+
+  const builtinPatch = await request(app)
+    .patch(`/v1/plans/${basicPlanId}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 200 });
+  assert.equal(builtinPatch.status, 404);
+
+  const emptyPatch = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({});
+  assert.equal(emptyPatch.status, 400);
+
+  const updatedPlan = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 350, max_per_request: 45 });
+  assert.equal(updatedPlan.status, 200);
+  assert.equal(updatedPlan.body.plan.monthly_allowance, 350);
+  assert.equal(updatedPlan.body.plan.max_per_request, 45);
+  const duplicatePlanUpdate = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(ownerHeaders)
+    .send({ name: "User-test custom plan" });
+  assert.equal(duplicatePlanUpdate.status, 409);
+
+  const foreignPlanPatch = await request(app)
+    .patch(`/v1/plans/${userPlan.id}`)
+    .set(otherHeaders)
+    .send({ name: "Taken over" });
+  assert.equal(foreignPlanPatch.status, 404);
+
+  const createdUser = await request(app)
+    .post("/v1/users")
+    .set(ownerHeaders)
+    .send({ external_id: "plan-assignment-user" });
+  assert.equal(createdUser.status, 201);
+  const usageMonth = "2026-10-01";
+  await pool.query(
+    "INSERT INTO account_usage (account_id, month, units_used) VALUES ($1, $2, 17)",
+    [accountId, usageMonth],
+  );
+  await pool.query(
+    "INSERT INTO user_usage (user_id, month, units_used) VALUES ($1, $2, 9)",
+    [createdUser.body.user.id, usageMonth],
+  );
+
+  const assignUser = await request(app)
+    .put("/v1/users/plan-assignment-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(assignUser.status, 200);
+  assert.equal(assignUser.body.plan.id, userPlan.id);
+
+  const userWithUpdatedPlan = await request(app)
+    .get("/v1/users/plan-assignment-user")
+    .set(ownerHeaders);
+  assert.equal(userWithUpdatedPlan.status, 200);
+  assert.equal(userWithUpdatedPlan.body.user.plan.monthly_allowance, 350);
+  assert.equal(userWithUpdatedPlan.body.user.plan.max_per_request, 45);
+  const retainedUsage = await pool.query<{
+    account_units: string;
+    user_units: string;
+  }>(
+    `SELECT au.units_used::text AS account_units, uu.units_used::text AS user_units
+     FROM account_usage au
+     JOIN user_usage uu ON uu.month = au.month
+     WHERE au.account_id = $1 AND uu.user_id = $2 AND au.month = $3`,
+    [accountId, createdUser.body.user.id, usageMonth],
+  );
+  assert.deepEqual(retainedUsage.rows[0], { account_units: "17", user_units: "9" });
+
+  const wrongKindForUser = await request(app)
+    .put("/v1/users/plan-assignment-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: accountPlan.id });
+  assert.equal(wrongKindForUser.status, 404);
+
+  const assignAccount = await request(app)
+    .put("/v1/account/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: accountPlan.id });
+  assert.equal(assignAccount.status, 200);
+  assert.equal(assignAccount.body.plan.id, accountPlan.id);
+
+  const updatedAccountPlan = await request(app)
+    .patch(`/v1/plans/${accountPlan.id}`)
+    .set(ownerHeaders)
+    .send({ monthly_allowance: 5500 });
+  assert.equal(updatedAccountPlan.status, 200);
+
+  const currentAccount = await request(app)
+    .get("/v1/account")
+    .set(ownerHeaders);
+  assert.equal(currentAccount.status, 200);
+  assert.equal(currentAccount.body.plan.id, accountPlan.id);
+  assert.equal(currentAccount.body.plan.monthly_allowance, 5500);
+
+  const wrongKindForAccount = await request(app)
+    .put("/v1/account/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(wrongKindForAccount.status, 404);
+
+  const foreignPlanAssignment = await request(app)
+    .put("/v1/users/plan-test-user/plan")
+    .set(otherHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(foreignPlanAssignment.status, 404);
+
+  const missingUserAssignment = await request(app)
+    .put("/v1/users/no-such-user/plan")
+    .set(ownerHeaders)
+    .send({ plan_id: userPlan.id });
+  assert.equal(missingUserAssignment.status, 404);
+
+  const hiddenForeignUser = await request(app)
+    .get("/v1/users/plan-test-user")
+    .set(ownerHeaders);
+  assert.equal(hiddenForeignUser.status, 404);
+  assert.ok(otherUserResult.rows[0].id);
+});
