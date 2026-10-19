@@ -1,5 +1,7 @@
 # Usage Metering and Quota Service
 
+![CI](https://github.com/raghadjam/UsageMeteringQuotaService/actions/workflows/ci.yml/badge.svg)
+
 Backend service for recording usage and enforcing account-level and user-level
 quotas. Accounts, users, custom plans, plan assignments, and transactional
 consumption with idempotent request history are implemented.
