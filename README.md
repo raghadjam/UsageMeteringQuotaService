@@ -94,9 +94,11 @@ usage changes neither.
 
 Use Node 22 or newer for local development. Run `npm test` with PostgreSQL
 available and `TEST_DATABASE_URL` set for the database integration tests. For
-example, start PostgreSQL 16 in Docker with a host port:
+example, install dependencies, then start PostgreSQL 16 in Docker with a host
+port:
 
 ```powershell
+npm ci
 docker run --rm -d --name usage-metering-test-db `
   -e POSTGRES_USER=usage_metering `
   -e POSTGRES_PASSWORD=test_password `
@@ -106,7 +108,7 @@ $env:TEST_DATABASE_URL = "postgres://usage_metering:test_password@localhost:5432
 npm test
 ```
 
-The latest recorded full run reports **33 passed, 0 failed, 0 skipped**. Set
+The latest recorded full run reports **34 passed, 0 failed, 0 skipped**. Set
 `TEST_DATABASE_URL` so the database tests run; skipped database tests do not
 count as a passing full run. Require zero skipped tests when checking the full
 suite.

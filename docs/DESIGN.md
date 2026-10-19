@@ -382,14 +382,17 @@ tables, counts, reproducible commands, raw CSVs, and remaining limitations.
 ## 14. Verification coverage
 
 `npm run build`, `npm run typecheck`, and the PostgreSQL-backed `npm test`
-passed; the test run reported 33 passed, 0 failed, and 0 skipped. Coverage
-includes API-key validation and cache TTL/capacity/isolation, account
-isolation, a 20-request concurrent duplicate storm, idempotent replay and
-conflict, concurrent quota enforcement, first-use monthly-row races, timeout
-rollback and same-ID retry, pool-wait exclusion, and parity between both
-consumption strategies. Each load-test run was followed by the accounting and
-request-ID audit; it returned no mismatches. Database logs showed no `40P01`
-deadlocks.
+passed; the latest run reported 34 passed, 0 failed, and 0 skipped. The
+database tests are grouped by area in `tests/db/schema.test.ts`,
+`tests/db/accounts-users-plans.test.ts`, `tests/db/consume.test.ts`, and
+`tests/db/usage-history.test.ts`; `tests/db/helpers.ts` holds their shared
+schema and seed setup. Coverage includes API-key validation and cache
+TTL/capacity/isolation, account isolation including cross-account consume,
+a 20-request concurrent duplicate storm, idempotent replay and conflict,
+concurrent quota enforcement, first-use monthly-row races, timeout rollback
+and same-ID retry, pool-wait exclusion, and parity between both consumption
+strategies. Each load-test run was followed by the accounting and request-ID
+audit; it returned no mismatches. Database logs showed no `40P01` deadlocks.
 
 ## 15. Predefined plans and the demo
 
