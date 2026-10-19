@@ -18,7 +18,7 @@ starts PostgreSQL 16 and the API, waits for health checks, and runs the
 dependency-free Node demo client. The client creates a demo account and
 demonstrates accepted and rejected requests and plan changes. The API is at
 `http://localhost:3000/v1`; check `http://localhost:3000/v1/health` for
-readiness. Never commit `.env` or real credentials.
+readiness. 
 
 ## Contents
 
