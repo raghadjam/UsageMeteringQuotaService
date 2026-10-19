@@ -376,7 +376,7 @@ will be rejected at that level. See [plan changes](docs/DESIGN.md#8-plan-changes
 
 ## Performance test
 
-**Performance summary (local Windows Docker Desktop, 2026-10-18)**
+**Performance summary**
 
 - Main-versus-perf mean throughput: 499.4 to 680.2 consume requests/sec (+36.2%).
 - At 100 VUs on one account, mean throughput was about 1.9x higher (231.8 vs 124.0 requests/sec).
